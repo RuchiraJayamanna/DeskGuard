@@ -204,8 +204,13 @@ measured with `tools\measure.py`. *Private* is Task Manager's **Memory** column.
 | Visible + motion detection | 1.0 % | 58.3 MB | 94.1 MB |
 | Hidden (camera open, default) | 0.34 % | 58.1 MB | 92.7 MB |
 | Hidden, camera released (opt-in) | 0.00 % | 54.3 MB | 90.6 MB |
-| After 30 min visible | *pending* | *pending* | *pending* |
+| After 30 min visible (+ one camera reopen beforehand) | 1.0 % | 69.0 MB | 100.4 MB |
 | Built `DeskGuard.exe`, 20 s after start | — | 53.6 MB | 89.6 MB |
+
+The 30-minute row ran in the same process right after the opt-in
+camera-off test, so it includes one camera reopen (≈6 MB, see *Known
+limitations*). The remaining ≈5 MB growth over 30 minutes is allocator and
+driver noise; a longer soak is needed to rule out a slow leak.
 
 Version 1.0.0 on the same machine used **435 MB** private memory: OpenBLAS and
 OpenCV each started a thread per CPU core with its own buffers. Version 1.1.0
