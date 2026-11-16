@@ -1,0 +1,4 @@
+# Runtime (tested together on Python 3.13; Windows wheels exist for 3.12–3.14)
+PySide6-Essentials==6.12.0      # QtCore/QtGui/QtWidgets only – no add-on modules
+opencv-python-headless==4.14.0.94  # no OpenCV GUI, no bundled Qt
+numpy==2.5.5

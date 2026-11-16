@@ -1,0 +1,29 @@
+# Builds DeskGuard-Setup-<version>.exe on a GitHub-hosted Windows machine.
+# Actions tab -> "Build DeskGuard installer" -> Run, then download the artifact.
+name: Build DeskGuard installer
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: python -m pytest -q
+        env:
+          QT_QPA_PLATFORM: offscreen
+      - run: pyinstaller --noconfirm --clean deskguard.spec
+      - run: choco install innosetup -y --no-progress
+      - shell: pwsh
+        run: |
+          $ver = python -c "import deskguard; print(deskguard.__version__)"
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Q "/DAppVersion=$ver" installer\deskguard.iss
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DeskGuard-Setup
+          path: dist/DeskGuard-Setup-*.exe
