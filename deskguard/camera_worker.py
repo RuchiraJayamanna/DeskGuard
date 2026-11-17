@@ -5,7 +5,10 @@ Responsibilities
 - Pace processing to the chosen frame rate (frames above that rate are grabbed
   but never decoded or processed).
 - Run motion detection when enabled.
-- Scale frames to the preview's exact pixel size, so the GUI only draws.
+- Scale frames to the preview's exact pixel size (with digital zoom/pan and
+  flips applied), so the GUI only draws.
+- Open the driver's settings dialog on request and remember what the user
+  changed there, re-applying it whenever the camera is opened.
 - Recover from disconnects with a backoff, never crashing the app.
 - Optionally release the camera (light off, ~0 CPU) after the preview has been
   hidden for IDLE_RELEASE_S with nothing to monitor; reopen when shown again.
@@ -27,8 +30,18 @@ import cv2
 import numpy as np
 from PySide6.QtCore import QThread, Signal
 
-from deskguard.camera import CameraError, OpenedCamera, PRIVACY_HINT, open_camera
+from deskguard.camera import (
+    PRIVACY_HINT,
+    CameraError,
+    OpenedCamera,
+    apply_props,
+    is_manual,
+    open_camera,
+    open_settings_dialog,
+    read_props,
+)
 from deskguard.motion import MotionDetector
+from deskguard.view import ViewTransform, flip_code
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +54,9 @@ DARK_CHECK_FRAMES = (10, 30)  # check after exposure settles, then stop checking
 IDLE_RELEASE_S = 60.0     # hidden + not monitoring this long => release camera
 PAUSED_MSG = "Paused – right-click to resume"
 HIDDEN_MSG = "Camera off while hidden"
+PROPS_WATCH_S = 120.0     # watch for driver-dialog changes this long after opening it
+PROPS_POLL_S = 2.0
+NO_SETTINGS_MSG = "This camera has no settings dialog"
 
 OpenFn = Callable[[int, int, int, int], OpenedCamera]
 
@@ -58,6 +74,7 @@ class CameraWorker(QThread):
     frame_ready = Signal()
     state_changed = Signal(str, str)   # CamState value, user-facing message
     motion_detected = Signal()
+    camera_props_changed = Signal(object)  # dict[str, float]: settings to save for this camera
 
     def __init__(self, open_fn: OpenFn = open_camera, parent=None) -> None:  # type: ignore[no-untyped-def]
         super().__init__(parent)
@@ -66,8 +83,11 @@ class CameraWorker(QThread):
         self._stop = False
 
         # Desired settings (written by GUI thread, read by worker thread).
-        self._index, self._width, self._height, self._fps = 0, 640, 480, 10
-        self._display = (240, 150, False)  # width px, height px, crop_to_fill
+        self._index, self._width, self._height, self._fps = 0, 640, 360, 10
+        self._display = (256, 144, False)  # width px, height px, crop_to_fill
+        self._view = (False, False, 1.0, 0.5, 0.5)  # flip_h, flip_v, zoom, pan_x, pan_y
+        self._props: dict[str, float] = {}  # saved hardware settings for this camera
+        self._settings_request = False
         self._visible = True
         self._monitor_hidden = False
         self._motion_enabled = False
@@ -89,6 +109,10 @@ class CameraWorker(QThread):
         self._state: CamState | None = None
         self._message = ""
         self.actual_size: tuple[int, int] | None = None
+        self._props_snapshot: dict[str, float] = {}
+        self._props_touched: set[str] = set()
+        self._props_watch_until = 0.0
+        self._props_next_poll = 0.0
 
     # ------------------------------------------------------------------ #
     # GUI-thread API (all cheap, thread-safe attribute writes)
@@ -105,6 +129,17 @@ class CameraWorker(QThread):
 
     def set_display(self, width: int, height: int, crop: bool) -> None:
         self._display = (max(1, width), max(1, height), crop)
+
+    def set_view(self, flip_h: bool, flip_v: bool, zoom: float, pan_x: float, pan_y: float) -> None:
+        self._view = (flip_h, flip_v, float(zoom), float(pan_x), float(pan_y))
+
+    def set_camera_props(self, props: dict[str, float]) -> None:
+        """Saved hardware settings for the configured camera; applied on (re)open."""
+        self._props = dict(props)
+
+    def request_settings_dialog(self) -> None:
+        self._settings_request = True
+        self._wake.set()
 
     def set_visible(self, visible: bool) -> None:
         self._visible = visible
@@ -231,6 +266,9 @@ class CameraWorker(QThread):
                 idle = False
                 last_ok = time.monotonic()
 
+            if self._settings_request or self._props_watch_until:
+                self._service_settings()
+
             fps = self._fps if mode == "display" else MONITOR_FPS
             interval = 1.0 / max(1, fps)
             tolerance = 0.3 * interval
@@ -321,6 +359,9 @@ class CameraWorker(QThread):
         self._buf = None
         self.actual_size = (cam.width, cam.height)
         self.detector.reset()
+        self._props_watch_until = 0.0
+        if self._props:
+            apply_props(cam.capture, self._props)
         msg = ""
         if (cam.width, cam.height) != (self._width, self._height):
             msg = f"{self._width}×{self._height} not supported – using {cam.width}×{cam.height}"
@@ -357,19 +398,53 @@ class CameraWorker(QThread):
             except cv2.error:
                 break
 
+    def _service_settings(self) -> None:
+        """Open the driver dialog on request, then poll for the user's changes."""
+        cam = self._cam
+        if cam is None:
+            return
+        now = time.monotonic()
+        if self._settings_request:
+            self._settings_request = False
+            if cam.backend != "DirectShow" or not open_settings_dialog(cam.capture):
+                self._set_state(CamState.LIVE, NO_SETTINGS_MSG, force=True)
+                return
+            log.info("Opened camera settings dialog")
+            self._props_snapshot = read_props(cam.capture)
+            self._props_touched = set()
+            self._props_watch_until = now + PROPS_WATCH_S
+            self._props_next_poll = now + PROPS_POLL_S
+            return
+        if now >= self._props_watch_until:
+            self._props_watch_until = 0.0
+            return
+        if now < self._props_next_poll:
+            return
+        self._props_next_poll = now + PROPS_POLL_S
+        current = read_props(cam.capture)
+        for name, value in current.items():
+            if value != self._props_snapshot.get(name) and is_manual(cam.capture, name):
+                self._props_touched.add(name)
+        if not self._props_touched:
+            return
+        merged = dict(self._props)
+        merged.update({k: current[k] for k in self._props_touched if k in current})
+        if merged != self._props:
+            self._props = merged
+            log.info("Camera settings changed: %s", sorted(self._props_touched))
+            self.camera_props_changed.emit(dict(merged))
+
     def _fit(self, frame: np.ndarray) -> np.ndarray:
         tw, th, crop = self._display
+        flip_h, flip_v, zoom, pan_x, pan_y = self._view
         h, w = frame.shape[:2]
-        if crop:
-            scale = max(tw / w, th / h)
-            cw, ch = min(w, round(tw / scale)), min(h, round(th / scale))
-            x, y = (w - cw) // 2, (h - ch) // 2
-            src, out = frame[y : y + ch, x : x + cw], (tw, th)
-        else:
-            scale = min(tw / w, th / h)
-            src, out = frame, (max(1, round(w * scale)), max(1, round(h * scale)))
-        interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
-        return cv2.resize(src, out, interpolation=interp)
+        vt = ViewTransform(w, h, tw, th, crop, zoom, pan_x, pan_y, flip_h, flip_v)
+        x, y, cw, ch = vt.source_rect()
+        out = vt.output_size()
+        interp = cv2.INTER_AREA if out[0] < cw else cv2.INTER_LINEAR
+        img = cv2.resize(frame[y : y + ch, x : x + cw], out, interpolation=interp)
+        code = flip_code(flip_h, flip_v)
+        return img if code is None else cv2.flip(img, code)
 
     def _publish(self, img: np.ndarray) -> None:
         now = time.monotonic()

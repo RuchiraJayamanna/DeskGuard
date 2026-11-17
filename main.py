@@ -35,7 +35,7 @@ def configure_runtime() -> None:
 
 
 def configure_cv2() -> None:
-    """Our per-frame work is tiny (240x150 resize, 160x120 motion check), so
+    """Our per-frame work is tiny (~256x144 resize, 160x120 motion check), so
     OpenCV's worker pool only adds thread wake-ups. OpenCL would allocate GPU
     memory for no benefit."""
     import cv2

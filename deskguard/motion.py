@@ -12,6 +12,8 @@ False-positive handling
   switched or camera auto-exposure) resets the background instead of alerting.
 - Warm-up frames after a reset are ignored while exposure settles.
 - A cooldown prevents repeated alerts for the same event.
+- Ignore zones (e.g. where the user sits) are masked out; fractions are
+  measured against the remaining (active) area only.
 """
 
 from __future__ import annotations
@@ -53,6 +55,9 @@ class MotionDetector:
         self._gray = np.empty((h, w), np.uint8)
         self._diff = np.empty((h, w), np.uint8)
         self._bg_u8 = np.empty((h, w), np.uint8)
+        # (mask, active pixel count). mask is 0 inside ignore zones, 255 elsewhere;
+        # None = no zones. Replaced as one tuple so the GUI thread can swap it safely.
+        self._zones: tuple[np.ndarray | None, int] = (None, w * h)
         self._background: np.ndarray | None = None
         self._consecutive = 0
         self._seen = 0
@@ -64,6 +69,19 @@ class MotionDetector:
 
     def set_cooldown(self, seconds: float) -> None:
         self.cooldown = max(0.0, float(seconds))
+
+    def set_ignore_zones(self, zones: list[list[float]]) -> None:
+        """Ignore motion inside these [x, y, w, h] rectangles (normalized 0..1)."""
+        w, h = self.size
+        if not zones:
+            self._zones = (None, w * h)
+            return
+        mask = np.full((h, w), 255, np.uint8)
+        for zx, zy, zw, zh in zones:
+            x0, y0 = int(np.floor(zx * w)), int(np.floor(zy * h))
+            x1, y1 = int(np.ceil((zx + zw) * w)), int(np.ceil((zy + zh) * h))
+            mask[max(0, y0):max(0, y1), max(0, x0):max(0, x1)] = 0
+        self._zones = (mask, cv2.countNonZero(mask))
 
     def reset(self) -> None:
         """Forget the background, e.g. after the camera is reopened."""
@@ -85,7 +103,10 @@ class MotionDetector:
         cv2.convertScaleAbs(self._background, dst=self._bg_u8)
         cv2.absdiff(self._gray, self._bg_u8, dst=self._diff)
         cv2.threshold(self._diff, self.pixel_threshold, 255, cv2.THRESH_BINARY, dst=self._diff)
-        fraction = cv2.countNonZero(self._diff) / self._diff.size
+        mask, active = self._zones
+        if mask is not None:
+            cv2.bitwise_and(self._diff, mask, dst=self._diff)
+        fraction = cv2.countNonZero(self._diff) / active if active else 0.0
         self.last_fraction = fraction
 
         self._seen += 1
@@ -98,7 +119,7 @@ class MotionDetector:
 
         cv2.accumulateWeighted(self._gray, self._background, self.learn_rate)
 
-        if fraction >= self.min_fraction:
+        if active and fraction >= self.min_fraction:
             self._consecutive += 1
         else:
             self._consecutive = 0

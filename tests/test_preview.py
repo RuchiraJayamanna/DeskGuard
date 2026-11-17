@@ -1,6 +1,7 @@
 """Smoke tests for the preview window and app wiring (offscreen Qt)."""
 
 import numpy as np
+import pytest
 from PySide6.QtCore import QPoint, QPointF, Qt
 from PySide6.QtGui import QMouseEvent
 
@@ -97,7 +98,7 @@ def test_app_starts_builds_menu_and_saves(qapp, tmp_path, monkeypatch):
     assert wait_until(qapp, lambda: guard.window._frame is not None)
     # default size & top-right placement
     g = guard.window.geometry()
-    assert (g.width(), g.height()) == (240, 150)
+    assert (g.width(), g.height()) == (256, 144)
 
     guard._build_menu()
     titles = [a.text() for a in guard.menu.actions()]
@@ -120,3 +121,83 @@ def test_app_starts_builds_menu_and_saves(qapp, tmp_path, monkeypatch):
     assert (saved.fps, saved.opacity, saved.window_x, saved.window_y) == (15, 85, 50, 60)
 
     guard.worker.stop()
+
+
+def _mouse(kind, pos, button=Qt.MouseButton.LeftButton, mods=Qt.KeyboardModifier.NoModifier):
+    buttons = button if kind != QMouseEvent.Type.MouseButtonRelease else Qt.MouseButton.NoButton
+    return QMouseEvent(kind, QPointF(pos), QPointF(pos), button, buttons, mods)
+
+
+def _drag(w, a, b, mods=Qt.KeyboardModifier.NoModifier):
+    w.mousePressEvent(_mouse(QMouseEvent.Type.MouseButtonPress, a, mods=mods))
+    w.mouseMoveEvent(_mouse(QMouseEvent.Type.MouseMove, b, mods=mods))
+    w.mouseReleaseEvent(_mouse(QMouseEvent.Type.MouseButtonRelease, b, mods=mods))
+
+
+def test_zone_edit_draws_zone_in_raw_coords_with_mirror(qapp):
+    w = PreviewWindow()
+    w.setGeometry(0, 0, 256, 144)
+    w.set_view_params((640, 360), False, 1.0, 0.5, 0.5, True, False)  # mirrored
+    zones = []
+    w.zones_changed.connect(lambda z: zones.append(z))
+    w.set_zone_edit(True)
+    _drag(w, QPoint(20, 40), QPoint(84, 112))  # left quarter of the preview
+    assert len(zones) == 1
+    x, y, zw, zh = zones[-1][0]
+    # mirrored: left of the preview is the right of the raw frame
+    assert x == pytest.approx(1 - 84 / 256, abs=0.01) and zw == pytest.approx(64 / 256, abs=0.01)
+    assert y == pytest.approx(40 / 144, abs=0.01) and zh == pytest.approx(72 / 144, abs=0.01)
+    assert (w.x(), w.y()) == (0, 0)  # drawing a zone did not move the window
+    w.grab()  # paints zones without error
+
+    # right-click on the zone deletes it
+    from PySide6.QtGui import QContextMenuEvent
+    w.contextMenuEvent(QContextMenuEvent(QContextMenuEvent.Reason.Mouse, QPoint(50, 70), QPoint(50, 70)))
+    assert zones[-1] == []
+
+    # tiny drags are clicks, not zones; Done leaves edit mode
+    _drag(w, QPoint(100, 60), QPoint(102, 61))
+    assert zones[-1] == []
+    done = []
+    w.zone_edit_finished.connect(lambda: done.append(1))
+    c = w._buttons()["done"].center()
+    _drag(w, c, c)
+    assert done == [1] and not w.zone_edit
+    # outside edit mode a drag moves the window again
+    w.show()
+    qapp.processEvents()
+    start = w.pos()
+    w.mousePressEvent(QMouseEvent(QMouseEvent.Type.MouseButtonPress, QPointF(100, 60), QPointF(100, 60),
+                                  Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
+    w.mouseMoveEvent(QMouseEvent(QMouseEvent.Type.MouseMove, QPointF(100, 60), QPointF(130, 70),
+                                 Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
+    assert w.pos() == start + QPoint(30, 10)
+    w.close()
+
+
+def test_ctrl_wheel_zooms_and_ctrl_drag_pans(qapp):
+    from PySide6.QtCore import QPoint as P
+    from PySide6.QtGui import QWheelEvent
+
+    w = PreviewWindow()
+    w.setGeometry(0, 0, 256, 144)
+    w.set_view_params((640, 360), False, 1.0, 0.5, 0.5, False, False)
+    views = []
+    w.view_changed.connect(lambda *v: views.append(v))
+
+    def wheel(dy, mods):
+        return QWheelEvent(QPointF(64, 72), QPointF(64, 72), P(0, 0), P(0, dy), Qt.MouseButton.NoButton,
+                           mods, Qt.ScrollPhase.NoScrollPhase, False)
+
+    w.wheelEvent(wheel(120, Qt.KeyboardModifier.NoModifier))
+    assert views == []  # plain wheel does nothing
+    w.wheelEvent(wheel(240, Qt.KeyboardModifier.ControlModifier))
+    zoom, px, py = views[-1]
+    assert zoom == pytest.approx(1.5625) and px < 0.5  # zoomed towards the cursor (left)
+    w.grab()  # zoom badge paints
+
+    _drag(w, QPoint(100, 70), QPoint(140, 70), mods=Qt.KeyboardModifier.ControlModifier)
+    assert views[-1][1] < px  # dragged right => view moved left
+    w.wheelEvent(wheel(-1200, Qt.KeyboardModifier.ControlModifier))
+    assert views[-1] == (1.0, 0.5, 0.5)  # zoomed fully out snaps back to the full view
+    w.close()

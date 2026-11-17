@@ -3,9 +3,13 @@
 A tiny always-on-top webcam preview for Windows 11. Mount a USB webcam on your
 cubicle partition and see who's approaching without turning around.
 
-- 240×150 floating preview, top-right by default. Drag to move, drag the edges to resize.
+- 256×144 (16:9) floating preview, top-right by default. Drag to move, drag the edges to resize.
+- Wide view: captures 640×360 by default, which uses the full sensor width (4:3 modes cut the sides off).
+- Rear-view-mirror image by default (flip left–right), plus flip upside-down / rotate 180° for any mounting.
+- Digital zoom and pan (Ctrl + wheel, Ctrl + drag), and the camera driver's own settings dialog (zoom, focus, exposure…).
 - It never takes keyboard focus, never shows in the taskbar, and makes no sounds or popups.
 - Optional motion detection (off by default) shows a red **MOTION** border.
+  **Ignore zones** let you draw over yourself so only the background (people approaching) triggers it.
 - Settings live in the right-click menu (on the preview or the tray icon).
 - Everything stays private: no recording, no screenshots, no audio, no network. Frames exist only in memory.
 
@@ -58,6 +62,9 @@ antivirus false positives.
 | Hide / show | Hover → **–** button, or left-click the tray icon |
 | Exit | Hover → **✕** button, or tray/right-click → Exit |
 | Settings | Right-click the preview or the tray icon |
+| Zoom in / out | **Ctrl + mouse wheel** over the preview (zooms at the cursor, 1×–4×) |
+| Pan while zoomed | **Ctrl + drag** |
+| Ignore yourself | Right-click → Motion detection → **Edit ignore zones…**, drag rectangles over where you sit, then **Done**. Right-click a zone to delete it. |
 
 **Status dot** (top-left of the preview, also on the tray icon):
 
@@ -72,10 +79,11 @@ antivirus false positives.
 
 | Menu | Options |
 |---|---|
-| Camera | Lists cameras by name (listing never opens a camera) |
-| Resolution | 640×480 (recommended), 1280×720, 1920×1080 |
+| Camera | Lists cameras by name (listing never opens a camera) · Camera settings… (driver dialog) · Forget saved camera settings |
+| View | Mirror (flip left–right, on by default) · Flip upside-down · Rotate 180° · Zoom 1×/1.5×/2×/3× · Reset zoom and pan |
+| Resolution | 640×360 (wide, recommended), 848×480, 1280×720, 1920×1080, 640×480 (4:3, narrower) |
 | Frame rate | 10 or 15 fps |
-| Motion detection | Enabled · Sensitivity Low/Medium/High · Cooldown 3/5/10 s · Keep monitoring while hidden · Show preview on motion |
+| Motion detection | Enabled · Edit / clear ignore zones · Sensitivity Low/Medium/High · Cooldown 3/5/10 s · Keep monitoring while hidden · Show preview on motion |
 | Window | Always on top · Fill window (crop) · Opacity 100/85/70/50% · Reset size and position |
 | Start with Windows | Per-user startup entry |
 | Pause camera | Releases the camera completely (its light turns off) |
@@ -87,6 +95,23 @@ antivirus false positives.
 - *Turn camera off when hidden (opt-in):* after 1 minute hidden the camera is released (light off, 0 % CPU) and reopened (<1 s) when you show the preview. Off by default because each reopen leaks ≈6 MB inside Windows DirectShow (see *Known limitations*).
 - *Monitoring on:* motion detection runs at 5 fps. Motion turns the tray icon red for 5 s.
 - *Show preview on motion:* the preview also pops up without taking focus, then hides again after 10 s unless you touch it.
+
+**Wide view.** Most webcams cut the sides off the sensor in 4:3 modes such as
+640×480. The 16:9 modes keep the full width; 640×360 costs about the same CPU as
+640×480. If your camera doesn't offer a mode, DeskGuard says so and uses the
+nearest one it gets. Digital zoom never makes the view wider than 1×; if your
+camera has optical zoom, set it to the widest in *Camera settings…*.
+
+**Ignore zones** are stored relative to the camera frame, so they stay on the
+same spot in the room when you flip, zoom or pan the preview. Motion inside a
+zone is ignored, and the sensitivity applies to the remaining area only. The
+zones show as faint dashed outlines while motion detection is on.
+
+**Camera settings…** opens the driver's own property sheet (DirectShow
+cameras). For 2 minutes afterwards DeskGuard notes which values you changed
+and re-applies them every time the camera opens. Focus, exposure and white
+balance are only saved while they are in manual mode, so automatic adjustment
+is never frozen into a fixed value.
 
 ### Files
 
@@ -108,22 +133,26 @@ Camera worker thread                         GUI thread
    ├ grab() every camera frame (no decode)       (no colour conversion, no scaling)
    ├ retrieve() only at 10/15 fps
    ├ motion: 160×120 grey diff (if enabled)
-   └ resize to window's exact pixel size ──► latest-frame slot (max 1 frame) ──► frame_ready
+   ├ zoom/pan = slice of the frame (no copy), resize to the window's pixel size, flip
+   └ ──► latest-frame slot (max 1 frame) ──► frame_ready
 ```
 
 There are two threads in total. If the GUI is busy, frames are replaced, never queued.
 OpenCV and OpenBLAS are limited to one thread each (`main.py`), and OpenCL is off.
-At 640×480 the camera is used in its default format (YUY2) with no property
-changes, so DirectShow builds its capture graph only once.
+When the requested size is the camera's default, no format property is
+changed, so DirectShow builds its capture graph only once. Other sizes (such
+as 640×360) change it exactly once per open. Saved hardware settings go
+through IAMVideoProcAmp/IAMCameraControl and don't rebuild the graph.
 
 | Module | Responsibility |
 |---|---|
 | `main.py` | Logging, single-instance lock, error dialogs, OpenCV/OpenBLAS thread and environment settings |
 | `deskguard/app.py` | Wiring: window ↔ worker ↔ tray ↔ menu ↔ settings; show/hide; stall watchdog |
-| `deskguard/preview_window.py` | Frameless no-focus window, painting, manual drag/resize, hover buttons |
+| `deskguard/preview_window.py` | Frameless no-focus window, painting, manual drag/resize, hover buttons, zone editing, Ctrl+wheel zoom / Ctrl+drag pan |
+| `deskguard/view.py` | Pure geometry: zoom/pan/crop/flip, preview ↔ camera-frame mapping |
 | `deskguard/camera_worker.py` | Capture loop, frame pacing, reconnect with backoff, black-image check |
-| `deskguard/camera.py` | Opening a camera with backend fallback; camera list |
-| `deskguard/motion.py` | Motion detector (pure OpenCV/NumPy, no Qt) |
+| `deskguard/camera.py` | Opening a camera with backend fallback; camera list; hardware property read/apply, driver dialog |
+| `deskguard/motion.py` | Motion detector with ignore-zone mask (pure OpenCV/NumPy, no Qt) |
 | `deskguard/config.py` | Settings dataclass, validation, atomic JSON save |
 | `deskguard/win32.py` | ctypes/winreg helpers: DirectShow camera names, rounded corners, topmost, autostart, memory stats |
 | `deskguard/icons.py` | App and tray icons drawn in code |
@@ -145,14 +174,15 @@ changes, so DirectShow builds its capture graph only once.
 python -m pytest -q
 ```
 
-There are 33 tests across four files:
+There are 68 tests across five files:
 
 | File | What it covers |
 |---|---|
-| `test_config.py` | Defaults, round-trip, invalid values, corrupt file |
-| `test_motion.py` | Noise, entering person, lights switched, slow drift, single-frame glitch, cooldown, sensitivity |
-| `test_camera.py` | A fake camera at 30 fps: 10/15 fps pacing, decoding only needed frames, bounded hand-off, hidden idle, opt-in camera release and monitoring modes, DirectShow property changes kept to a minimum, unplug/replug recovery, retry backoff, pause/resume, resolution fallback message, clean release on stop, driver exceptions |
-| `test_preview.py` | No-focus window flags, painting, drag/resize/minimum size, buttons, full app start → menu → hide/show → settings saved |
+| `test_config.py` | Defaults, round-trip, invalid values, corrupt file, 1.1 → 1.2 migration (wide defaults, your own choices kept) |
+| `test_view.py` | Zoom/pan/crop/flip geometry, preview ↔ camera-frame round trips, zoom-at-cursor, pan direction |
+| `test_motion.py` | Noise, entering person, lights switched, slow drift, single-frame glitch, cooldown, sensitivity, ignore zones |
+| `test_camera.py` | A fake camera at 30 fps: 10/15 fps pacing, decoding only needed frames, bounded hand-off, hidden idle, opt-in camera release and monitoring modes, DirectShow property changes kept to a minimum, unplug/replug recovery, retry backoff, pause/resume, resolution fallback message, clean release on stop, driver exceptions, mirror/zoom in the published frame, settings dialog (saved changes, auto-focus drift ignored, re-applied on reopen) |
+| `test_preview.py` | No-focus window flags, painting, drag/resize/minimum size, buttons, full app start → menu → hide/show → settings saved, drawing/deleting ignore zones (with mirror), Ctrl+wheel zoom, Ctrl+drag pan |
 
 ### Real-camera measurement
 
@@ -194,8 +224,9 @@ written to the log 10 s after start and then every minute. Task Manager's
 
 ## 6. Measured performance
 
-Windows 11 Pro, Intel 12th gen, HP Wide Vision HD Camera, 640×480, 10 fps,
-measured with `tools\measure.py`. *Private* is Task Manager's **Memory** column.
+Measured on version 1.1.0 (Windows 11 Pro, Intel 12th gen, HP Wide Vision HD
+Camera, 640×480, 10 fps) with `tools\measure.py`; not yet re-measured for 1.2.0
+at 640×360. *Private* is Task Manager's **Memory** column.
 
 | Phase | CPU | Private | Working set |
 |---|---|---|---|
@@ -250,6 +281,9 @@ shrank from 184 MB to 152 MB.
 | "Can't open …" | Close other camera apps. Then check *Settings › Privacy & security › Camera*: **Camera access** and **Let desktop apps access your camera** must both be on. |
 | Black image | Lens cover or privacy shutter closed, or another app is holding the camera. |
 | Wrong camera | Right-click → Camera → pick it. The choice is remembered by name. |
-| 1080p is choppy | Use 640×480. The preview is tiny, so higher resolutions only cost CPU and USB bandwidth. |
+| 1080p is choppy | Use 640×360. The preview is tiny, so higher resolutions only cost CPU and USB bandwidth. |
+| Image is mirrored the wrong way | Right-click → View → Mirror (toggle). |
+| Motion alerts when I move | Right-click → Motion detection → Edit ignore zones… and draw over yourself. |
+| "This camera has no settings dialog" | The camera isn't using DirectShow, or its driver has no property sheet. |
 | Preview lost off-screen | Right-click the tray icon → Window → Reset size and position, or start with `--reset`. |
 | "Already running" | Look for the DeskGuard icon in the tray (it may be in the ^ overflow area). |

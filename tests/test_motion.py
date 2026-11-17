@@ -96,3 +96,46 @@ def test_sensitivity_ordering():
             hits += det.process(f, 2.0 + i * 0.1)
         small.append(hits)
     assert small[0] == 0 and small[2] >= 1
+
+
+def moving_figure(det, base, rng, x0, y0=150, t0=2.0, n=10, step=10):
+    hits = 0
+    for i in range(n):
+        f = noisy(base, rng)
+        x = x0 + i * step
+        f[y0 : y0 + 300, x : x + 80] = 30
+        hits += det.process(f, t0 + i * 0.1)
+    return hits
+
+
+def test_motion_inside_ignore_zone_is_ignored():
+    base, rng = scene()
+    det = MotionDetector(sensitivity="high", cooldown=0)
+    det.set_ignore_zones([[0.4, 0.2, 0.6, 0.8]])  # right part of the image (where "I" sit)
+    feed_static(det, base, rng, 20)
+    assert moving_figure(det, base, rng, x0=300) == 0  # figure stays within x 300..470 of 640
+
+
+def test_motion_outside_ignore_zone_still_triggers():
+    base, rng = scene()
+    det = MotionDetector(sensitivity="medium", cooldown=0)
+    det.set_ignore_zones([[0.6, 0.0, 0.4, 1.0]])
+    feed_static(det, base, rng, 20)
+    assert moving_figure(det, base, rng, x0=20, step=15) >= 1
+
+
+def test_zones_covering_everything_never_trigger():
+    base, rng = scene()
+    det = MotionDetector(sensitivity="high", cooldown=0)
+    det.set_ignore_zones([[0.0, 0.0, 1.0, 1.0]])
+    feed_static(det, base, rng, 20)
+    assert moving_figure(det, base, rng, x0=20, step=30) == 0
+
+
+def test_clearing_zones_restores_detection():
+    base, rng = scene()
+    det = MotionDetector(sensitivity="medium", cooldown=0)
+    det.set_ignore_zones([[0.0, 0.0, 1.0, 1.0]])
+    det.set_ignore_zones([])
+    feed_static(det, base, rng, 20)
+    assert moving_figure(det, base, rng, x0=300, step=20) >= 1

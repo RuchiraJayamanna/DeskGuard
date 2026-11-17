@@ -20,6 +20,7 @@ from deskguard.config import (
     OPACITY_CHOICES,
     RESOLUTIONS,
     SENSITIVITY_CHOICES,
+    MAX_CAMERAS_WITH_PROPS,
     Config,
     ConfigStore,
     log_dir,
@@ -34,6 +35,7 @@ AUTO_HIDE_S = 10.0         # auto-shown preview hides again after this
 STALL_WARN_S = 4.0         # no frames for this long while live => warn
 DIAG_INTERVAL_MS = 60_000
 SCREEN_MARGIN = 16
+ZOOM_CHOICES = (1.0, 1.5, 2.0, 3.0)
 
 STATE_LABELS = {
     "starting": "Starting",
@@ -59,6 +61,8 @@ class DeskGuardApp(QObject):
         self._stalled = False
         self._auto_shown = False
         self._quitting = False
+        self._raw_size: tuple[int, int] | None = None
+        self._prefs_dirty = False
         self.cpu = win32.CpuSampler()
 
         self.window = PreviewWindow()
@@ -85,10 +89,14 @@ class DeskGuardApp(QObject):
         w.geometry_changed.connect(self._save_timer.start)
         w.display_size_changed.connect(self._on_display_size)
         w.user_interacted.connect(self._cancel_auto_hide)
+        w.view_changed.connect(self._on_view_changed)
+        w.zones_changed.connect(self._on_zones_changed)
+        w.zone_edit_finished.connect(self._sync_zones)
 
         self.worker.frame_ready.connect(self._on_frame)
         self.worker.state_changed.connect(self._on_state)
         self.worker.motion_detected.connect(self._on_motion)
+        self.worker.camera_props_changed.connect(self._on_camera_props)
 
         qapp.aboutToQuit.connect(self._shutdown)
 
@@ -111,7 +119,9 @@ class DeskGuardApp(QObject):
             self.window.set_on_top(False)
 
         self.worker.configure_camera(cfg.camera_index, cfg.width, cfg.height, cfg.fps)
+        self.worker.set_camera_props(cfg.camera_props.get(self._camera_name(), {}))
         self.worker.set_display(*self.window.physical_size(), cfg.crop_to_fill)
+        self._apply_view()
         self._apply_motion()
         self.worker.set_release_when_hidden(cfg.release_when_hidden)
         self.worker.start()
@@ -145,12 +155,17 @@ class DeskGuardApp(QObject):
 
     def _resolve_camera_by_name(self) -> None:
         """If cameras were re-plugged in a different order, follow the saved name."""
-        if not self.cfg.camera_name:
-            return
         names = list_cameras()
         self._camera_names = names
-        if self.cfg.camera_name in names:
+        if self.cfg.camera_name and self.cfg.camera_name in names:
             self.cfg.camera_index = names.index(self.cfg.camera_name)
+
+    def _camera_name(self) -> str:
+        """Name of the configured camera (key for its saved hardware settings)."""
+        if self.cfg.camera_name:
+            return self.cfg.camera_name
+        names, i = self._camera_names, self.cfg.camera_index
+        return names[i] if 0 <= i < len(names) else f"Camera {i}"
 
     # ------------------------------------------------------------------ #
     # Window geometry
@@ -181,10 +196,14 @@ class DeskGuardApp(QObject):
         return QRect(avail.right() - w - SCREEN_MARGIN + 1, avail.top() + SCREEN_MARGIN, w, h)
 
     def _save_geometry(self) -> None:
+        """Debounced save of window geometry (and of live zoom/pan changes)."""
         g = self.window.geometry()
         cfg = self.cfg
+        dirty, self._prefs_dirty = self._prefs_dirty, False
         if (cfg.window_x, cfg.window_y, cfg.window_w, cfg.window_h) != (g.x(), g.y(), g.width(), g.height()):
             cfg.window_x, cfg.window_y, cfg.window_w, cfg.window_h = g.x(), g.y(), g.width(), g.height()
+            dirty = True
+        if dirty:
             self.store.save(cfg)
 
     def _reset_geometry(self) -> None:
@@ -201,6 +220,9 @@ class DeskGuardApp(QObject):
             if self._stalled:
                 self._stalled = False
                 self.window.set_state(self.state, self.message)
+            if self._raw_size != self.worker.actual_size:
+                self._raw_size = self.worker.actual_size
+                self._sync_window_view()
             self.window.set_frame(frame)
 
     def _on_state(self, state: str, message: str) -> None:
@@ -312,11 +334,14 @@ class DeskGuardApp(QObject):
 
     def _apply_motion(self) -> None:
         c = self.cfg
+        self.worker.detector.set_ignore_zones(c.ignore_zones)
         self.worker.set_motion(c.motion_enabled, c.motion_sensitivity, c.motion_cooldown, c.monitor_while_hidden)
+        self._sync_zones()
 
     def _set_camera(self, index: int, name: str) -> None:
         self.cfg.camera_index, self.cfg.camera_name = index, name
         self._save()
+        self.worker.set_camera_props(self.cfg.camera_props.get(name, {}))
         self.worker.configure_camera(index, self.cfg.width, self.cfg.height, self.cfg.fps)
 
     def _set_resolution(self, w: int, h: int) -> None:
@@ -347,6 +372,68 @@ class DeskGuardApp(QObject):
     def _set_crop(self, crop: bool) -> None:
         self._set_cfg("crop_to_fill", crop)
         self.worker.set_display(*self.window.physical_size(), crop)
+        self._sync_window_view()
+
+    # View (flip / digital zoom) ------------------------------------------
+    def _apply_view(self) -> None:
+        c = self.cfg
+        self.worker.set_view(c.flip_h, c.flip_v, c.zoom, c.pan_x, c.pan_y)
+        self._sync_window_view()
+
+    def _sync_window_view(self) -> None:
+        c = self.cfg
+        self.window.set_view_params(self._raw_size, c.crop_to_fill, c.zoom, c.pan_x, c.pan_y, c.flip_h, c.flip_v)
+
+    def _set_view(self, **changes) -> None:  # type: ignore[no-untyped-def]
+        for name, value in changes.items():
+            setattr(self.cfg, name, value)
+        self._save()
+        self._apply_view()
+
+    def _set_zoom(self, zoom: float) -> None:
+        self._set_view(zoom=zoom, pan_x=0.5, pan_y=0.5)
+
+    def _on_view_changed(self, zoom: float, pan_x: float, pan_y: float) -> None:
+        """Live Ctrl+wheel / Ctrl+drag: apply now, save debounced."""
+        c = self.cfg
+        c.zoom, c.pan_x, c.pan_y = round(zoom, 3), round(pan_x, 4), round(pan_y, 4)
+        self.worker.set_view(c.flip_h, c.flip_v, c.zoom, c.pan_x, c.pan_y)
+        self._sync_window_view()
+        self._prefs_dirty = True
+        self._save_timer.start()
+
+    # Ignore zones --------------------------------------------------------
+    def _sync_zones(self) -> None:
+        c = self.cfg
+        self.window.set_zones(c.ignore_zones, c.motion_enabled)
+
+    def _on_zones_changed(self, zones: list[list[float]]) -> None:
+        self.cfg.ignore_zones = [list(z) for z in zones]
+        self._save()
+        self.worker.detector.set_ignore_zones(self.cfg.ignore_zones)
+        self._sync_zones()
+
+    def _edit_zones(self) -> None:
+        if not self.window.isVisible():
+            self._cancel_auto_hide()
+            self.show_preview()
+        self._sync_zones()
+        self.window.set_zone_edit(True)
+
+    # Hardware camera settings ---------------------------------------------
+    def _on_camera_props(self, props: dict[str, float]) -> None:
+        saved = self.cfg.camera_props
+        name = self._camera_name()
+        saved.pop(name, None)
+        saved[name] = dict(props)
+        while len(saved) > MAX_CAMERAS_WITH_PROPS:
+            saved.pop(next(iter(saved)))  # drop the oldest camera
+        self._save()
+
+    def _forget_camera_props(self) -> None:
+        self.cfg.camera_props.pop(self._camera_name(), None)
+        self._save()
+        self.worker.set_camera_props({})
 
     def _set_paused(self, paused: bool) -> None:
         self.worker.set_paused(paused)
@@ -410,10 +497,32 @@ class DeskGuardApp(QObject):
         cam_menu.aboutToShow.connect(partial(self._fill_camera_menu, cam_menu))
         cam_menu.addAction("Searching…").setEnabled(False)
 
+        cam_menu.addSeparator()
+        live = self.state == "live"
+        self._action(cam_menu, "Camera settings… (zoom, focus, exposure)",
+                     self.worker.request_settings_dialog, enabled=live)
+        self._action(cam_menu, "Forget saved camera settings", self._forget_camera_props,
+                     enabled=bool(c.camera_props.get(self._camera_name())))
+
+        # View
+        vm = m.addMenu("View")
+        self._action(vm, "Mirror (flip left–right)", lambda on: self._set_view(flip_h=on), c.flip_h)
+        self._action(vm, "Flip upside-down", lambda on: self._set_view(flip_v=on), c.flip_v)
+        self._action(vm, "Rotate 180°", lambda: self._set_view(flip_h=not c.flip_h, flip_v=not c.flip_v))
+        vm.addSeparator()
+        zm = vm.addMenu("Zoom")
+        grp = QActionGroup(zm)
+        for z in ZOOM_CHOICES:
+            self._action(zm, f"{z:g}×" + ("  (widest)" if z == 1 else ""), partial(self._set_zoom, z),
+                         abs(c.zoom - z) < 0.01, grp)
+        self._action(vm, "Reset zoom and pan", partial(self._set_zoom, 1.0), enabled=c.zoom > 1.01)
+        vm.addAction("Tip: Ctrl + wheel to zoom, Ctrl + drag to pan").setEnabled(False)
+
         res_menu = m.addMenu("Resolution")
         grp = QActionGroup(res_menu)
         for w, h in RESOLUTIONS:
-            label = f"{w} × {h}" + ("  (recommended)" if (w, h) == (640, 480) else "")
+            note = "  (wide, recommended)" if (w, h) == (640, 360) else "  (4:3 – narrower)" if (w, h) == (640, 480) else ""
+            label = f"{w} × {h}{note}"
             self._action(res_menu, label, partial(self._set_resolution, w, h), (c.width, c.height) == (w, h), grp)
 
         fps_menu = m.addMenu("Frame rate")
@@ -424,6 +533,11 @@ class DeskGuardApp(QObject):
         # Motion
         mo = m.addMenu("Motion detection")
         self._action(mo, "Enabled", lambda on: self._set_cfg("motion_enabled", on, self._apply_motion), c.motion_enabled)
+        mo.addSeparator()
+        self._action(mo, "Edit ignore zones… (draw over yourself)", self._edit_zones,
+                     enabled=self._raw_size is not None)
+        self._action(mo, f"Clear ignore zones ({len(c.ignore_zones)})", lambda: self._on_zones_changed([]),
+                     enabled=bool(c.ignore_zones))
         mo.addSeparator()
         sens = mo.addMenu("Sensitivity")
         grp = QActionGroup(sens)

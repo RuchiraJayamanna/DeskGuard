@@ -21,6 +21,7 @@ import cv2
 import numpy as np
 
 from deskguard import win32
+from deskguard.config import CAMERA_PROPS
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +41,8 @@ class Capture(Protocol):
     def grab(self) -> bool: ...
     def retrieve(self, image: np.ndarray | None = None) -> tuple[bool, np.ndarray | None]: ...
     def release(self) -> None: ...
+    def get(self, prop: int) -> float: ...
+    def set(self, prop: int, value: float) -> bool: ...
 
 
 @dataclass
@@ -48,6 +51,64 @@ class OpenedCamera:
     width: int
     height: int
     backend: str
+
+
+# Properties whose value drifts while the camera adjusts it automatically. They
+# are only saved when their auto flag reads as manual (0); unreadable => skip.
+_AUTO_FLAGS: dict[str, str] = {
+    "focus": "CAP_PROP_AUTOFOCUS",
+    "exposure": "CAP_PROP_AUTO_EXPOSURE",
+    "white_balance": "CAP_PROP_AUTO_WB",
+}
+UNSUPPORTED = -1.0  # what OpenCV's DirectShow backend returns for unsupported properties
+
+
+def read_props(cap: Capture) -> dict[str, float]:
+    """Current hardware property values the camera reports (unsupported ones omitted)."""
+    values: dict[str, float] = {}
+    for name, attr in CAMERA_PROPS.items():
+        try:
+            v = float(cap.get(getattr(cv2, attr)))
+        except (cv2.error, AttributeError, TypeError, ValueError):
+            continue
+        if v != UNSUPPORTED:
+            values[name] = v
+    return values
+
+
+def is_manual(cap: Capture, name: str) -> bool:
+    """True if property `name` is under manual control (safe to save its value)."""
+    attr = _AUTO_FLAGS.get(name)
+    if attr is None:
+        return True
+    try:
+        return float(cap.get(getattr(cv2, attr))) == 0.0
+    except (cv2.error, AttributeError, TypeError, ValueError):
+        return False
+
+
+def apply_props(cap: Capture, props: dict[str, float]) -> None:
+    """Re-apply saved hardware settings. With DirectShow these go through
+    IAMVideoProcAmp / IAMCameraControl and do not rebuild the capture graph."""
+    for name, value in props.items():
+        attr = CAMERA_PROPS.get(name)
+        if attr is None:
+            continue
+        try:
+            if not cap.set(getattr(cv2, attr), float(value)):
+                log.info("Camera did not accept %s=%s", name, value)
+        except (cv2.error, AttributeError):
+            log.info("Could not set camera property %s", name)
+
+
+def open_settings_dialog(cap: Capture) -> bool:
+    """Open the driver's own property sheet (DirectShow only). OpenCV shows it
+    on its own thread, so this returns immediately."""
+    try:
+        return bool(cap.set(cv2.CAP_PROP_SETTINGS, 1))
+    except cv2.error:
+        log.exception("Could not open the camera settings dialog")
+        return False
 
 
 def list_cameras() -> list[str]:

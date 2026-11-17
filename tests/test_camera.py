@@ -23,6 +23,10 @@ class FakeCapture:
         self.retrieves = 0
         self._next = time.monotonic()
         self.lock = threading.Lock()
+        self.left_dark = False          # left half black, right half grey (to test flips)
+        self.props = {}                 # cv2 prop id -> value (hardware settings)
+        self.prop_sets = []
+        self.settings_opened = 0
 
     def grab(self):
         if not self.connected or self.released:
@@ -40,7 +44,22 @@ class FakeCapture:
         w, h = self.size
         frame = image if image is not None and image.shape == (h, w, 3) else np.empty((h, w, 3), np.uint8)
         frame[:] = 100
+        if self.left_dark:
+            frame[:, : w // 2] = 0
         return True, frame
+
+    def get(self, prop):
+        return self.props.get(prop, -1.0)
+
+    def set(self, prop, value):
+        import cv2
+
+        if prop == cv2.CAP_PROP_SETTINGS:
+            self.settings_opened += 1
+            return True
+        self.prop_sets.append((prop, value))
+        self.props[prop] = value
+        return True
 
     def release(self):
         self.released = True
@@ -52,14 +71,17 @@ class FakeCameraSystem:
         self.available = True
         self.opens = 0
         self.captures: list[FakeCapture] = []
+        self.backend = "fake"
+        self.left_dark = False
 
     def open(self, index, width, height, fps):
         self.opens += 1
         if not self.available:
             raise CameraError("No webcam found.")
         cap = FakeCapture(self.fps, self.size)
+        cap.left_dark = self.left_dark
         self.captures.append(cap)
-        return OpenedCamera(cap, *self.size, "fake")
+        return OpenedCamera(cap, *self.size, self.backend)
 
 
 @pytest.fixture
@@ -316,3 +338,61 @@ def test_dshow_hd_sets_mjpg_and_size_but_not_fps():
     frame = _configure(cap, cv2.CAP_DSHOW, 1280, 720, 10)
     assert frame.shape == (720, 1280, 3)
     assert cap.sets == [cv2.CAP_PROP_FOURCC, cv2.CAP_PROP_FRAME_WIDTH, cv2.CAP_PROP_FRAME_HEIGHT]
+
+
+def test_mirror_and_zoom_applied_to_preview(qapp, worker, system):
+    system.left_dark = True
+    worker.configure_camera(0, 640, 480, 10)
+    worker.set_view(False, False, 1.0, 0.5, 0.5)
+    worker.start()
+    assert wait_until(qapp, lambda: any(s == "live" for s, _ in worker.states))
+    f = collect_frames(qapp, worker, 0.5)[-1]
+    assert f[75, 10, 0] == 0 and f[75, -10, 0] == 100      # not mirrored: dark on the left
+    worker.set_view(True, False, 1.0, 0.5, 0.5)
+    time.sleep(0.3)
+    f = collect_frames(qapp, worker, 0.5)[-1]
+    assert f[75, 10, 0] == 100 and f[75, -10, 0] == 0      # mirrored: dark on the right
+    worker.set_view(False, False, 4.0, 0.9, 0.5)            # zoomed into the grey right side
+    time.sleep(0.3)
+    f = collect_frames(qapp, worker, 0.5)[-1]
+    assert f.shape == (150, 200, 3) and (f == 100).all()
+
+
+def test_settings_dialog_unsupported_backend(qapp, worker, system):
+    from deskguard.camera_worker import NO_SETTINGS_MSG
+
+    worker.configure_camera(0, 640, 480, 10)
+    worker.start()
+    assert wait_until(qapp, lambda: any(s == "live" for s, _ in worker.states))
+    worker.request_settings_dialog()
+    assert wait_until(qapp, lambda: ("live", NO_SETTINGS_MSG) in worker.states)
+    assert system.captures[0].settings_opened == 0
+
+
+def test_settings_dialog_changes_are_saved_and_reapplied(qapp, worker, system, monkeypatch):
+    import cv2
+
+    from deskguard import camera_worker
+
+    monkeypatch.setattr(camera_worker, "PROPS_POLL_S", 0.1)
+    system.backend = "DirectShow"
+    saved = []
+    worker.camera_props_changed.connect(lambda d: saved.append(d))
+    worker.configure_camera(0, 640, 480, 10)
+    worker.start()
+    assert wait_until(qapp, lambda: any(s == "live" for s, _ in worker.states))
+    cap = system.captures[0]
+    cap.props.update({cv2.CAP_PROP_BRIGHTNESS: 0.0, cv2.CAP_PROP_FOCUS: 10.0, cv2.CAP_PROP_AUTOFOCUS: 1.0})
+    worker.request_settings_dialog()
+    assert wait_until(qapp, lambda: cap.settings_opened == 1)
+    time.sleep(0.2)
+    # user changes brightness in the dialog; autofocus moves focus on its own
+    cap.props[cv2.CAP_PROP_BRIGHTNESS] = 20.0
+    cap.props[cv2.CAP_PROP_FOCUS] = 30.0
+    assert wait_until(qapp, lambda: bool(saved))
+    assert saved[-1] == {"brightness": 20.0}               # auto-focus drift is not saved
+
+    # reopen (e.g. reconnect) re-applies the saved values
+    worker.configure_camera(1, 640, 480, 10)
+    assert wait_until(qapp, lambda: len(system.captures) == 2 and system.captures[1].prop_sets)
+    assert system.captures[1].prop_sets == [(cv2.CAP_PROP_BRIGHTNESS, 20.0)]
