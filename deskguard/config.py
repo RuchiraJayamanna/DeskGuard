@@ -30,13 +30,17 @@ FPS_CHOICES: tuple[int, ...] = (10, 15)
 SENSITIVITY_CHOICES: tuple[str, ...] = ("low", "medium", "high")
 COOLDOWN_CHOICES: tuple[int, ...] = (3, 5, 10)
 OPACITY_CHOICES: tuple[int, ...] = (100, 85, 70, 50)
+DWELL_CHOICES: tuple[int, ...] = (3, 5, 10, 15)
+ALERT_COOLDOWN_CHOICES: tuple[int, ...] = (30, 60, 120, 300)
+STRICTNESS_CHOICES: tuple[str, ...] = ("relaxed", "normal", "strict")
+THEME_CHOICES: tuple[str, ...] = ("system", "dark", "light")
 
 MIN_WINDOW_W, MIN_WINDOW_H = 160, 100
 MAX_WINDOW_W, MAX_WINDOW_H = 1920, 1200
 
 MAX_ZONES = 8
 MAX_CAMERAS_WITH_PROPS = 8
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
 
 # Hardware camera properties DeskGuard may save and re-apply (name -> cv2 CAP_PROP_* name).
 CAMERA_PROPS: dict[str, str] = {
@@ -106,6 +110,14 @@ class Config:
     pan_y: float = 0.5
     # Hardware settings changed in the driver dialog, per camera name.
     camera_props: dict[str, dict[str, float]] = field(default_factory=dict)
+    # Watch my back: recognise the user, alert when someone lingers behind them.
+    presence_enabled: bool = False
+    watch_dwell_s: int = 5
+    watch_person_without_face: bool = True
+    face_strictness: str = "normal"
+    alert_cooldown_s: int = 60
+    # Appearance of the Settings window and toast.
+    theme: str = "system"
     config_version: int = CONFIG_VERSION
 
 
@@ -151,6 +163,14 @@ def _valid(name: str, value: Any, default: Any) -> bool:
         )
     if name == "config_version":
         return type(value) is int
+    if name == "watch_dwell_s":
+        return type(value) is int and value in DWELL_CHOICES
+    if name == "alert_cooldown_s":
+        return type(value) is int and value in ALERT_COOLDOWN_CHOICES
+    if name == "face_strictness":
+        return value in STRICTNESS_CHOICES
+    if name == "theme":
+        return value in THEME_CHOICES
     return False
 
 

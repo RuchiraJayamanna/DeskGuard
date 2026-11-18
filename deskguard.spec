@@ -21,7 +21,9 @@ a = Analysis(
     [str(ROOT / "main.py")],
     pathex=[str(ROOT)],
     binaries=[],
-    datas=[],
+    # Face models for "Watch my back" (loaded only while the feature is on).
+    datas=[(str(ROOT / "resources" / "models" / "*.onnx"), "resources/models"),
+           (str(ROOT / "resources" / "models" / "LICENSE*"), "resources/models")],
     hiddenimports=[],
     excludes=EXCLUDES,
     noarchive=False,

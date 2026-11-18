@@ -18,6 +18,8 @@ False-positive handling
 
 from __future__ import annotations
 
+import threading
+
 import cv2
 import numpy as np
 
@@ -58,6 +60,9 @@ class MotionDetector:
         # (mask, active pixel count). mask is 0 inside ignore zones, 255 elsewhere;
         # None = no zones. Replaced as one tuple so the GUI thread can swap it safely.
         self._zones: tuple[np.ndarray | None, int] = (None, w * h)
+        self._static_zones: list[list[float]] = []
+        self._dynamic_zones: list[list[float]] = []
+        self._zones_lock = threading.Lock()  # GUI sets static zones, worker sets dynamic ones
         self._background: np.ndarray | None = None
         self._consecutive = 0
         self._seen = 0
@@ -72,6 +77,21 @@ class MotionDetector:
 
     def set_ignore_zones(self, zones: list[list[float]]) -> None:
         """Ignore motion inside these [x, y, w, h] rectangles (normalized 0..1)."""
+        self._static_zones = [list(z) for z in zones]
+        self._rebuild_mask()
+
+    def set_dynamic_zones(self, zones: list[list[float]]) -> None:
+        """Extra ignore rectangles that change at runtime (the user's body area)."""
+        zones = [list(z) for z in zones]
+        if zones != self._dynamic_zones:
+            self._dynamic_zones = zones
+            self._rebuild_mask()
+
+    def _rebuild_mask(self) -> None:
+        with self._zones_lock:
+            self._build_mask(self._static_zones + self._dynamic_zones)
+
+    def _build_mask(self, zones: list[list[float]]) -> None:
         w, h = self.size
         if not zones:
             self._zones = (None, w * h)

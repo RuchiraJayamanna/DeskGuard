@@ -396,3 +396,96 @@ def test_settings_dialog_changes_are_saved_and_reapplied(qapp, worker, system, m
     worker.configure_camera(1, 640, 480, 10)
     assert wait_until(qapp, lambda: len(system.captures) == 2 and system.captures[1].prop_sets)
     assert system.captures[1].prop_sets == [(cv2.CAP_PROP_BRIGHTNESS, 20.0)]
+
+
+class FakeFaceEngine:
+    """Stands in for the YuNet/SFace engine: faces come from `self.faces`."""
+
+    def __init__(self):
+        self.loaded = False
+        self.loads = self.unloads = 0
+        self.faces = []
+        self.n = 0
+
+    def load(self):
+        self.loaded = True
+        self.loads += 1
+
+    def unload(self):
+        if self.loaded:
+            self.unloads += 1
+        self.loaded = False
+
+    def detect(self, frame):
+        return list(self.faces)
+
+    def embed(self, frame, face):
+        self.n += 1
+        v = face.row.copy()
+        v[2 + self.n % 50] = 0.3  # vary samples slightly
+        return v / np.linalg.norm(v)
+
+
+def _vec(i):
+    v = np.zeros(128, np.float32)
+    v[i] = 1.0
+    return v
+
+
+def test_watch_my_back_alerts_and_unloads(qapp, system, tmp_path):
+    from deskguard.faces import Face, FaceProfile
+
+    engine = FakeFaceEngine()
+    profile = FaceProfile(tmp_path / "face.json")
+    profile.vectors = [_vec(0)] * 3
+    w = CameraWorker(open_fn=system.open, engine=engine, profile=profile)
+    alerts, states = [], []
+    w.watcher_alert.connect(lambda kind, secs: alerts.append((kind, secs)))
+    w.presence_changed.connect(states.append)
+    w.configure_camera(0, 640, 480, 10)
+    try:
+        w.start()
+        assert wait_until(qapp, lambda: w._state is not None and w._state.value == "live")
+        assert engine.loads == 0  # models are not loaded until the feature is on
+        engine.faces = [Face((0.6, 0.3, 0.15, 0.25), 0.95, _vec(0)), Face((0.1, 0.2, 0.08, 0.12), 0.9, _vec(1))]
+        w.set_presence(True, 1.0, False, 0.363, 60, "medium")
+        assert wait_until(qapp, lambda: bool(alerts), timeout=5)
+        assert alerts[0][0] == "face" and engine.loads == 1
+        assert any(s.me_body is not None for s in states)
+        assert w.detector._dynamic_zones  # MOTION ignores the user's body too
+        w.set_presence(False, 1.0, False, 0.363, 60, "medium")
+        assert wait_until(qapp, lambda: engine.unloads == 1)
+        assert w.detector._dynamic_zones == []
+        # hidden preview keeps watching while the feature is on
+        w.set_visible(False)
+        assert w._mode() == "idle"
+        w.set_presence(True, 1.0, False, 0.363, 60, "medium")
+        assert w._mode() == "monitor"
+    finally:
+        assert w.stop()
+    assert not engine.loaded  # released on stop
+
+
+def test_face_enrolment_saves_profile(qapp, system, tmp_path):
+    from deskguard.faces import Face, FaceProfile
+
+    engine = FakeFaceEngine()
+    profile = FaceProfile(tmp_path / "face.json")
+    w = CameraWorker(open_fn=system.open, engine=engine, profile=profile)
+    progress, frames = [], []
+    w.enroll_progress.connect(progress.append)
+    w.enroll_frame_ready.connect(lambda: frames.append(w.take_enroll_frame()))
+    w.configure_camera(0, 640, 480, 10)
+    w.set_view(True, False, 1.0, 0.5, 0.5)
+    engine.faces = [Face((0.4, 0.3, 0.2, 0.35), 0.97, _vec(0))]
+    try:
+        w.start()
+        w.start_enroll()
+        assert wait_until(qapp, lambda: any(p["done"] for p in progress), timeout=10)
+    finally:
+        assert w.stop()
+    assert profile.enrolled and (tmp_path / "face.json").exists()
+    done = [p for p in progress if p["done"]][0]
+    assert done["flip_h"] is True and done["progress"] == 1.0
+    assert any(f is not None and f.shape == (180, 320, 3) for f in frames)
+    assert not w.enrolling

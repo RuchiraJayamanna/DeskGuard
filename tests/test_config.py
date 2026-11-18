@@ -78,7 +78,7 @@ def test_v1_defaults_migrate_to_wide_view():
     old = {"width": 640, "height": 480, "window_w": 240, "window_h": 150, "fps": 15}
     cfg = from_dict(old)
     assert (cfg.width, cfg.height, cfg.window_w, cfg.window_h, cfg.fps) == (640, 360, 256, 144, 15)
-    assert cfg.flip_h is True and cfg.config_version == 2
+    assert cfg.flip_h is True and cfg.config_version == 3
     assert old["width"] == 640 and old["height"] == 480  # input not mutated
 
 
@@ -90,3 +90,17 @@ def test_v1_user_choices_are_kept():
 def test_v2_640x480_is_not_migrated_again():
     cfg = from_dict({"width": 640, "height": 480, "config_version": 2})
     assert (cfg.width, cfg.height) == (640, 480)
+
+
+def test_watch_my_back_fields():
+    d = Config()
+    assert (d.presence_enabled, d.watch_dwell_s, d.watch_person_without_face, d.face_strictness,
+            d.alert_cooldown_s, d.theme) == (False, 5, True, "normal", 60, "system")
+    cfg = from_dict({"presence_enabled": True, "watch_dwell_s": 10, "face_strictness": "strict",
+                     "alert_cooldown_s": 120, "theme": "light", "config_version": 3})
+    assert (cfg.presence_enabled, cfg.watch_dwell_s, cfg.face_strictness, cfg.alert_cooldown_s, cfg.theme) == (
+        True, 10, "strict", 120, "light")
+    bad = from_dict({"watch_dwell_s": 4, "face_strictness": "max", "alert_cooldown_s": 1, "theme": "pink",
+                     "presence_enabled": "yes", "config_version": 3})
+    assert (bad.watch_dwell_s, bad.face_strictness, bad.alert_cooldown_s, bad.theme, bad.presence_enabled) == (
+        5, "normal", 60, "system", False)

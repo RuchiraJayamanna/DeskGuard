@@ -1,4 +1,4 @@
-"""Wires the preview window, camera worker, tray icon, menu and settings together."""
+"""Wires the preview window, camera worker, tray icon, menu, Settings window and toast together."""
 
 from __future__ import annotations
 
@@ -7,25 +7,18 @@ import os
 import time
 from functools import partial
 
-from PySide6.QtCore import QObject, QPoint, QRect, QTimer, QUrl
+from PySide6.QtCore import QObject, QPoint, QRect, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from deskguard import APP_NAME, __version__, icons, win32
 from deskguard.camera import list_cameras
 from deskguard.camera_worker import HIDDEN_MSG, CameraWorker
-from deskguard.config import (
-    COOLDOWN_CHOICES,
-    FPS_CHOICES,
-    OPACITY_CHOICES,
-    RESOLUTIONS,
-    SENSITIVITY_CHOICES,
-    MAX_CAMERAS_WITH_PROPS,
-    Config,
-    ConfigStore,
-    log_dir,
-)
+from deskguard.config import MAX_CAMERAS_WITH_PROPS, Config, ConfigStore, config_dir, log_dir
+from deskguard.faces import STRICTNESS, FaceProfile
+from deskguard.presence import PresenceState
 from deskguard.preview_window import PreviewWindow
+from deskguard.ui import theme
 
 log = logging.getLogger(__name__)
 
@@ -35,7 +28,6 @@ AUTO_HIDE_S = 10.0         # auto-shown preview hides again after this
 STALL_WARN_S = 4.0         # no frames for this long while live => warn
 DIAG_INTERVAL_MS = 60_000
 SCREEN_MARGIN = 16
-ZOOM_CHOICES = (1.0, 1.5, 2.0, 3.0)
 
 STATE_LABELS = {
     "starting": "Starting",
@@ -48,11 +40,21 @@ STATE_LABELS = {
 
 
 class DeskGuardApp(QObject):
-    def __init__(self, qapp: QApplication, store: ConfigStore, diag: bool = False) -> None:
+    changed = Signal()          # a setting was changed and saved
+    status_changed = Signal()   # camera state / Watch my back status changed
+
+    def __init__(self, qapp: QApplication, store: ConfigStore, diag: bool = False,
+                 profile: FaceProfile | None = None) -> None:
         super().__init__()
         self.qapp = qapp
         self.store = store
         self.cfg: Config = store.load()
+        self.profile = profile or FaceProfile(config_dir() / "face.json")
+        self.profile.load()
+        self.presence = PresenceState()
+        self._alert_active = False
+        self.toast = None       # ToastWindow, created on first alert
+        self.settings = None    # SettingsWindow, created when opened
         self.diag = diag  # --diag: log RAM/CPU every minute
 
         self.state, self.message = "starting", ""
@@ -68,6 +70,7 @@ class DeskGuardApp(QObject):
         self.window = PreviewWindow()
         self.window.setWindowIcon(icons.icon())
         self.worker = CameraWorker()
+        self.worker.set_profile(self.profile)
 
         self.menu = QMenu()
         self.menu.aboutToShow.connect(self._build_menu)
@@ -92,11 +95,15 @@ class DeskGuardApp(QObject):
         w.view_changed.connect(self._on_view_changed)
         w.zones_changed.connect(self._on_zones_changed)
         w.zone_edit_finished.connect(self._sync_zones)
+        w.settings_requested.connect(self.open_settings)
 
         self.worker.frame_ready.connect(self._on_frame)
         self.worker.state_changed.connect(self._on_state)
         self.worker.motion_detected.connect(self._on_motion)
         self.worker.camera_props_changed.connect(self._on_camera_props)
+        self.worker.presence_changed.connect(self._on_presence)
+        self.worker.watcher_alert.connect(self._on_watcher_alert)
+        self.worker.watcher_cleared.connect(self._on_watcher_cleared)
 
         qapp.aboutToQuit.connect(self._shutdown)
 
@@ -112,6 +119,7 @@ class DeskGuardApp(QObject):
     # ------------------------------------------------------------------ #
     def start(self) -> None:
         cfg = self.cfg
+        theme.set_current(theme.palette_for(cfg.theme))
         self._resolve_camera_by_name()
         self._restore_geometry()
         self.window.setWindowOpacity(cfg.opacity / 100)
@@ -123,6 +131,7 @@ class DeskGuardApp(QObject):
         self.worker.set_display(*self.window.physical_size(), cfg.crop_to_fill)
         self._apply_view()
         self._apply_motion()
+        self._apply_presence()
         self.worker.set_release_when_hidden(cfg.release_when_hidden)
         self.worker.start()
 
@@ -145,6 +154,10 @@ class DeskGuardApp(QObject):
         self._quitting = True
         self._save_geometry()
         self.tray.hide()
+        if self.toast is not None:
+            self.toast.hide()
+        if self.settings is not None:
+            self.settings.close()
         if not self.worker.stop(3000):
             # A driver call is hanging. Settings are saved; Windows releases the
             # camera when the process exits.
@@ -206,7 +219,7 @@ class DeskGuardApp(QObject):
         if dirty:
             self.store.save(cfg)
 
-    def _reset_geometry(self) -> None:
+    def reset_geometry(self) -> None:
         self.window.setGeometry(self._default_rect(Config.window_w, Config.window_h))
         self._save_geometry()
 
@@ -231,6 +244,7 @@ class DeskGuardApp(QObject):
         self._stalled = False
         self.window.set_state(state, message)
         self._update_tray()
+        self.status_changed.emit()
         if state in ("error", "reconnecting") and message:
             log.info("Camera state: %s – %s", state, message)
         if state == "live" and message:
@@ -311,16 +325,20 @@ class DeskGuardApp(QObject):
                 self._cancel_auto_hide()
                 self.show_preview()
 
-    def _status_label(self) -> str:
+    def status_label(self) -> str:
         if self.state == "paused" and self.message == HIDDEN_MSG:
             return "Camera off while hidden"
         return STATE_LABELS.get(self.state, self.state)
 
     def _update_tray(self) -> None:
+        if self._alert_active:
+            self.tray.setIcon(icons.icon("motion"))
+            self.tray.setToolTip(f"{APP_NAME} – someone is watching you")
+            return
         if self._tray_alert_timer.isActive():
             return
         self.tray.setIcon(icons.icon(self.state))
-        label = self._status_label()
+        label = self.status_label()
         size = self.worker.actual_size
         detail = f" ({size[0]}×{size[1]} @ {self.cfg.fps} fps)" if self.state == "live" and size else ""
         hidden = "" if self.window.isVisible() else " · preview hidden"
@@ -331,6 +349,7 @@ class DeskGuardApp(QObject):
     # ------------------------------------------------------------------ #
     def _save(self) -> None:
         self.store.save(self.cfg)
+        self.changed.emit()
 
     def _apply_motion(self) -> None:
         c = self.cfg
@@ -338,39 +357,39 @@ class DeskGuardApp(QObject):
         self.worker.set_motion(c.motion_enabled, c.motion_sensitivity, c.motion_cooldown, c.monitor_while_hidden)
         self._sync_zones()
 
-    def _set_camera(self, index: int, name: str) -> None:
+    def set_camera(self, index: int, name: str) -> None:
         self.cfg.camera_index, self.cfg.camera_name = index, name
         self._save()
         self.worker.set_camera_props(self.cfg.camera_props.get(name, {}))
         self.worker.configure_camera(index, self.cfg.width, self.cfg.height, self.cfg.fps)
 
-    def _set_resolution(self, w: int, h: int) -> None:
+    def set_resolution(self, w: int, h: int) -> None:
         self.cfg.width, self.cfg.height = w, h
         self._save()
         self.worker.configure_camera(self.cfg.camera_index, w, h, self.cfg.fps)
 
-    def _set_fps(self, fps: int) -> None:
+    def set_fps(self, fps: int) -> None:
         self.cfg.fps = fps
         self._save()
         self.worker.set_fps(fps)
         self._update_tray()
 
-    def _set_cfg(self, name: str, value, apply=None) -> None:  # type: ignore[no-untyped-def]
+    def set_cfg(self, name: str, value, apply=None) -> None:  # type: ignore[no-untyped-def]
         setattr(self.cfg, name, value)
         self._save()
         if apply:
             apply()
 
-    def _set_on_top(self, on: bool) -> None:
-        self._set_cfg("always_on_top", on)
+    def set_on_top(self, on: bool) -> None:
+        self.set_cfg("always_on_top", on)
         self.window.set_on_top(on)
 
-    def _set_opacity(self, pct: int) -> None:
-        self._set_cfg("opacity", pct)
+    def set_opacity(self, pct: int) -> None:
+        self.set_cfg("opacity", pct)
         self.window.setWindowOpacity(pct / 100)
 
-    def _set_crop(self, crop: bool) -> None:
-        self._set_cfg("crop_to_fill", crop)
+    def set_crop(self, crop: bool) -> None:
+        self.set_cfg("crop_to_fill", crop)
         self.worker.set_display(*self.window.physical_size(), crop)
         self._sync_window_view()
 
@@ -384,14 +403,14 @@ class DeskGuardApp(QObject):
         c = self.cfg
         self.window.set_view_params(self._raw_size, c.crop_to_fill, c.zoom, c.pan_x, c.pan_y, c.flip_h, c.flip_v)
 
-    def _set_view(self, **changes) -> None:  # type: ignore[no-untyped-def]
+    def set_view(self, **changes) -> None:  # type: ignore[no-untyped-def]
         for name, value in changes.items():
             setattr(self.cfg, name, value)
         self._save()
         self._apply_view()
 
-    def _set_zoom(self, zoom: float) -> None:
-        self._set_view(zoom=zoom, pan_x=0.5, pan_y=0.5)
+    def set_zoom(self, zoom: float) -> None:
+        self.set_view(zoom=zoom, pan_x=0.5, pan_y=0.5)
 
     def _on_view_changed(self, zoom: float, pan_x: float, pan_y: float) -> None:
         """Live Ctrl+wheel / Ctrl+drag: apply now, save debounced."""
@@ -411,9 +430,13 @@ class DeskGuardApp(QObject):
         self.cfg.ignore_zones = [list(z) for z in zones]
         self._save()
         self.worker.detector.set_ignore_zones(self.cfg.ignore_zones)
+        self.worker.set_presence_zones(self.cfg.ignore_zones)
         self._sync_zones()
 
-    def _edit_zones(self) -> None:
+    def clear_zones(self) -> None:
+        self._on_zones_changed([])
+
+    def edit_zones(self) -> None:
         if not self.window.isVisible():
             self._cancel_auto_hide()
             self.show_preview()
@@ -430,23 +453,170 @@ class DeskGuardApp(QObject):
             saved.pop(next(iter(saved)))  # drop the oldest camera
         self._save()
 
-    def _forget_camera_props(self) -> None:
+    def forget_camera_props(self) -> None:
         self.cfg.camera_props.pop(self._camera_name(), None)
         self._save()
         self.worker.set_camera_props({})
 
-    def _set_paused(self, paused: bool) -> None:
+    def set_paused(self, paused: bool) -> None:
         self.worker.set_paused(paused)
+        QTimer.singleShot(0, self.changed.emit)
+
+    def set_motion_option(self, name: str, value) -> None:  # type: ignore[no-untyped-def]
+        self.set_cfg(name, value, self._apply_motion)
+        if name == "motion_sensitivity":
+            self._apply_presence()
+
+    def set_release_when_hidden(self, on: bool) -> None:
+        self.set_cfg("release_when_hidden", on, lambda: self.worker.set_release_when_hidden(on))
+
+    def open_camera_settings(self) -> None:
+        self.worker.request_settings_dialog()
+
+    def camera_names(self) -> list[str]:
+        self._camera_names = list_cameras()  # DirectShow enumeration: does not open any camera
+        return self._camera_names
+
+    def set_theme(self, name: str) -> None:
+        self.set_cfg("theme", name)
+        theme.set_current(theme.palette_for(name))
+        if self.settings is not None:
+            self.settings.apply_theme()
+        if self.toast is not None:
+            self.toast.update()
+
+    def set_autostart(self, on: bool) -> None:
+        win32.set_autostart(on)
+        self.changed.emit()
+
+    def open_log_folder(self) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_dir())))
+
+    def open_settings_folder(self) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(config_dir())))
+
+    # ------------------------------------------------------------------ #
+    # Watch my back
+    # ------------------------------------------------------------------ #
+    def _apply_presence(self) -> None:
+        c = self.cfg
+        self.worker.set_presence_zones(c.ignore_zones)
+        self.worker.set_presence(c.presence_enabled, c.watch_dwell_s, c.watch_person_without_face,
+                                 STRICTNESS.get(c.face_strictness, STRICTNESS["normal"]),
+                                 c.alert_cooldown_s, c.motion_sensitivity)
+        if not c.presence_enabled:
+            self._on_presence(PresenceState())
+        self.window.set_presence(self.presence, c.presence_enabled)
+
+    def set_presence_enabled(self, on: bool) -> None:
+        self.set_cfg("presence_enabled", on, self._apply_presence)
+        self.status_changed.emit()
+        if on and not self.profile.enrolled:
+            self.open_settings("face")  # first use: learn the user's face
+
+    def set_presence_option(self, name: str, value) -> None:  # type: ignore[no-untyped-def]
+        self.set_cfg(name, value, self._apply_presence)
+
+    def forget_face(self) -> None:
+        self.profile.forget()
+        self.worker.set_profile(self.profile)
+        log.info("Face profile deleted")
+        self.changed.emit()
+        self.status_changed.emit()
+
+    def watch_status(self) -> tuple[str, str]:
+        """(severity, text) describing Watch my back, for the Settings window."""
+        if not self.cfg.presence_enabled:
+            return "off", "Off – turn on to be told when someone stands behind you."
+        if self.presence.error:
+            return "error", self.presence.error
+        if self._alert_active or (self.presence.watching and self.presence.watch_seconds >= 1):
+            return "alert", "Someone is behind you"
+        if self.state != "live" and self.window.isVisible():
+            return "warning", "Waiting for the camera…"
+        if not self.profile.enrolled:
+            return "warning", "On – set up your face so DeskGuard knows which person is you."
+        if self.presence.me_face is not None:
+            return "ok", "On – you are recognised, watching behind you."
+        return "ok", "On – watching behind you."
+
+    def _on_presence(self, state: PresenceState) -> None:
+        was = (self.presence.watching, bool(self.presence.me_face), self.presence.error)
+        self.presence = state
+        self.window.set_presence(state, self.cfg.presence_enabled)
+        if self.toast is not None and self.toast.isVisible() and self.toast.kind != "test":
+            if state.watching:
+                self.toast.update_seconds(state.watch_seconds)
+            else:
+                self.toast.person_left()
+        if was != (state.watching, bool(state.me_face), state.error):
+            self.status_changed.emit()
+
+    def _on_watcher_alert(self, kind: str, seconds: float) -> None:
+        log.info("Watch my back: someone behind the user (%s, %.0f s)", kind, seconds)
+        self._alert_active = True
+        self._update_tray()
+        self.window.flash_alert(8.0)
+        self._toast().show_alert(kind, seconds, self._preview_screen())
+        self.status_changed.emit()
+
+    def _on_watcher_cleared(self) -> None:
+        self._alert_active = False
+        self._update_tray()
+        if self.toast is not None:
+            self.toast.person_left()
+        self.status_changed.emit()
+
+    def test_alert(self) -> None:
+        self._toast().show_alert("test", 0, self._preview_screen())
+
+    def _toast(self):  # type: ignore[no-untyped-def]
+        if self.toast is None:
+            from deskguard.ui.toast import ToastWindow
+
+            self.toast = ToastWindow()
+            self.toast.setWindowIcon(icons.icon())
+            self.toast.show_preview_requested.connect(self._show_from_toast)
+        return self.toast
+
+    def _show_from_toast(self) -> None:
+        self._cancel_auto_hide()
+        self.show_preview()
+        self.window.flash_alert(5.0)
+
+    def _preview_screen(self) -> QRect:
+        screen = QGuiApplication.screenAt(self.window.geometry().center()) or QGuiApplication.primaryScreen()
+        return screen.availableGeometry() if screen else QRect(0, 0, 1280, 720)
+
+    # ------------------------------------------------------------------ #
+    # Settings window (created on demand, destroyed when closed)
+    # ------------------------------------------------------------------ #
+    def open_settings(self, page: str | None = None) -> None:
+        if self.settings is None:
+            from deskguard.ui.settings_window import SettingsWindow
+
+            self.settings = SettingsWindow(self)
+            self.settings.destroyed.connect(self._settings_closed)
+        if page:
+            self.settings.show_page(page)
+        self.settings.show()
+        self.settings.raise_()
+        self.settings.activateWindow()
+
+    def _settings_closed(self) -> None:
+        self.settings = None
 
     def _log_resources(self) -> None:
         ws, private = win32.memory_usage_mb()
         log.info(
-            "resources: working_set=%.1f MB private=%.1f MB cpu=%.2f%% state=%s visible=%s motion=%s",
+            "resources: working_set=%.1f MB private=%.1f MB cpu=%.2f%% state=%s visible=%s motion=%s watch=%s",
             ws, private, self.cpu.sample(), self.state, self.window.isVisible(), self.cfg.motion_enabled,
+            self.cfg.presence_enabled,
         )
 
     # ------------------------------------------------------------------ #
-    # Menu (shared by right-click on the preview and the tray icon)
+    # Quick menu (right-click on the preview or the tray icon). Everything
+    # else lives in the Settings window.
     # ------------------------------------------------------------------ #
     def _popup_menu(self, pos: QPoint) -> None:
         self.menu.popup(pos)
@@ -470,11 +640,9 @@ class DeskGuardApp(QObject):
     def _build_menu(self) -> None:
         m, c = self.menu, self.cfg
         m.clear()
-        for child in m.findChildren(QMenu):
-            child.deleteLater()
 
         size = self.worker.actual_size
-        status = self._status_label()
+        status = self.status_label()
         if self.state == "live" and size:
             status += f" · {size[0]}×{size[1]}"
         m.addAction(icons.icon(self.state), status).setEnabled(False)
@@ -485,102 +653,14 @@ class DeskGuardApp(QObject):
                      self.hide_preview if visible else lambda: (self._cancel_auto_hide(), self.show_preview()))
         paused = self.worker.paused
         self._action(m, "Resume camera" if paused else "Pause camera (turns camera off)",
-                     partial(self._set_paused, not paused))
-        self._action(m, "Turn camera off when hidden (after 1 min)",
-                     lambda on: self._set_cfg("release_when_hidden", on,
-                                              lambda: self.worker.set_release_when_hidden(on)),
-                     c.release_when_hidden)
+                     partial(self.set_paused, not paused))
         m.addSeparator()
 
-        # Camera
-        cam_menu = m.addMenu("Camera")
-        cam_menu.aboutToShow.connect(partial(self._fill_camera_menu, cam_menu))
-        cam_menu.addAction("Searching…").setEnabled(False)
-
-        cam_menu.addSeparator()
-        live = self.state == "live"
-        self._action(cam_menu, "Camera settings… (zoom, focus, exposure)",
-                     self.worker.request_settings_dialog, enabled=live)
-        self._action(cam_menu, "Forget saved camera settings", self._forget_camera_props,
-                     enabled=bool(c.camera_props.get(self._camera_name())))
-
-        # View
-        vm = m.addMenu("View")
-        self._action(vm, "Mirror (flip left–right)", lambda on: self._set_view(flip_h=on), c.flip_h)
-        self._action(vm, "Flip upside-down", lambda on: self._set_view(flip_v=on), c.flip_v)
-        self._action(vm, "Rotate 180°", lambda: self._set_view(flip_h=not c.flip_h, flip_v=not c.flip_v))
-        vm.addSeparator()
-        zm = vm.addMenu("Zoom")
-        grp = QActionGroup(zm)
-        for z in ZOOM_CHOICES:
-            self._action(zm, f"{z:g}×" + ("  (widest)" if z == 1 else ""), partial(self._set_zoom, z),
-                         abs(c.zoom - z) < 0.01, grp)
-        self._action(vm, "Reset zoom and pan", partial(self._set_zoom, 1.0), enabled=c.zoom > 1.01)
-        vm.addAction("Tip: Ctrl + wheel to zoom, Ctrl + drag to pan").setEnabled(False)
-
-        res_menu = m.addMenu("Resolution")
-        grp = QActionGroup(res_menu)
-        for w, h in RESOLUTIONS:
-            note = "  (wide, recommended)" if (w, h) == (640, 360) else "  (4:3 – narrower)" if (w, h) == (640, 480) else ""
-            label = f"{w} × {h}{note}"
-            self._action(res_menu, label, partial(self._set_resolution, w, h), (c.width, c.height) == (w, h), grp)
-
-        fps_menu = m.addMenu("Frame rate")
-        grp = QActionGroup(fps_menu)
-        for fps in FPS_CHOICES:
-            self._action(fps_menu, f"{fps} fps", partial(self._set_fps, fps), c.fps == fps, grp)
-
-        # Motion
-        mo = m.addMenu("Motion detection")
-        self._action(mo, "Enabled", lambda on: self._set_cfg("motion_enabled", on, self._apply_motion), c.motion_enabled)
-        mo.addSeparator()
-        self._action(mo, "Edit ignore zones… (draw over yourself)", self._edit_zones,
-                     enabled=self._raw_size is not None)
-        self._action(mo, f"Clear ignore zones ({len(c.ignore_zones)})", lambda: self._on_zones_changed([]),
-                     enabled=bool(c.ignore_zones))
-        mo.addSeparator()
-        sens = mo.addMenu("Sensitivity")
-        grp = QActionGroup(sens)
-        for s in SENSITIVITY_CHOICES:
-            self._action(sens, s.capitalize(), partial(self._set_cfg, "motion_sensitivity", s, self._apply_motion),
-                         c.motion_sensitivity == s, grp)
-        cool = mo.addMenu("Cooldown")
-        grp = QActionGroup(cool)
-        for sec in COOLDOWN_CHOICES:
-            self._action(cool, f"{sec} seconds", partial(self._set_cfg, "motion_cooldown", sec, self._apply_motion),
-                         c.motion_cooldown == sec, grp)
-        mo.addSeparator()
-        self._action(mo, "Keep monitoring while hidden",
-                     lambda on: self._set_cfg("monitor_while_hidden", on, self._apply_motion), c.monitor_while_hidden)
-        self._action(mo, "Show preview on motion (while hidden)",
-                     lambda on: self._set_cfg("show_on_motion", on), c.show_on_motion,
-                     enabled=c.monitor_while_hidden)
-
-        # Window
-        wm = m.addMenu("Window")
-        self._action(wm, "Always on top", self._set_on_top, c.always_on_top)
-        self._action(wm, "Fill window (crop edges)", self._set_crop, c.crop_to_fill)
-        op = wm.addMenu("Opacity")
-        grp = QActionGroup(op)
-        for pct in OPACITY_CHOICES:
-            self._action(op, f"{pct}%", partial(self._set_opacity, pct), c.opacity == pct, grp)
-        wm.addSeparator()
-        self._action(wm, "Reset size and position", self._reset_geometry)
-
-        if win32.IS_WINDOWS:
-            self._action(m, "Start with Windows", win32.set_autostart, win32.autostart_enabled())
-
+        self._action(m, "Watch my back", self.set_presence_enabled, c.presence_enabled)
+        self._action(m, "Motion detection", lambda on: self.set_motion_option("motion_enabled", on), c.motion_enabled)
+        self._action(m, "Edit ignore zones…", self.edit_zones, enabled=self._raw_size is not None)
+        self._action(m, "Mirror image", lambda on: self.set_view(flip_h=on), c.flip_h)
         m.addSeparator()
-        self._action(m, "Open log folder", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_dir()))))
+
+        self._action(m, "Settings…", self.open_settings)
         self._action(m, f"Exit {APP_NAME}", self.quit)
-
-    def _fill_camera_menu(self, menu: QMenu) -> None:
-        menu.clear()
-        names = list_cameras()  # DirectShow enumeration: does not open any camera
-        self._camera_names = names
-        if not names:
-            menu.addAction("No cameras found").setEnabled(False)
-            return
-        grp = QActionGroup(menu)
-        for i, name in enumerate(names):
-            self._action(menu, name, partial(self._set_camera, i, name), i == self.cfg.camera_index, grp)

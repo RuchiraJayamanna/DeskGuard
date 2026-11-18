@@ -9,6 +9,8 @@ Responsibilities
   flips applied), so the GUI only draws.
 - Open the driver's settings dialog on request and remember what the user
   changed there, re-applying it whenever the camera is opened.
+- "Watch my back" (optional): run the PresenceTracker a few times per second,
+  and face enrolment on request. Face models are loaded only while needed.
 - Recover from disconnects with a backoff, never crashing the app.
 - Optionally release the camera (light off, ~0 CPU) after the preview has been
   hidden for IDLE_RELEASE_S with nothing to monitor; reopen when shown again.
@@ -21,10 +23,12 @@ nothing can pile up in a queue.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections.abc import Callable
 from enum import Enum
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -40,7 +44,9 @@ from deskguard.camera import (
     open_settings_dialog,
     read_props,
 )
+from deskguard.faces import Enroller, FaceEngine, FaceEngineError, FaceProfile
 from deskguard.motion import MotionDetector
+from deskguard.presence import PresenceState, PresenceTracker
 from deskguard.view import ViewTransform, flip_code
 
 log = logging.getLogger(__name__)
@@ -57,6 +63,8 @@ HIDDEN_MSG = "Camera off while hidden"
 PROPS_WATCH_S = 120.0     # watch for driver-dialog changes this long after opening it
 PROPS_POLL_S = 2.0
 NO_SETTINGS_MSG = "This camera has no settings dialog"
+PRESENCE_HZ = 3.0         # face / person analysis rate (independent of preview fps)
+ENROLL_VIEW = (320, 180)  # live picture for the face-setup screen
 
 OpenFn = Callable[[int, int, int, int], OpenedCamera]
 
@@ -75,8 +83,14 @@ class CameraWorker(QThread):
     state_changed = Signal(str, str)   # CamState value, user-facing message
     motion_detected = Signal()
     camera_props_changed = Signal(object)  # dict[str, float]: settings to save for this camera
+    presence_changed = Signal(object)      # PresenceState (only when it changed)
+    watcher_alert = Signal(str, float)     # kind ("face" | "person"), seconds present
+    watcher_cleared = Signal()
+    enroll_progress = Signal(object)       # dict: progress, hint, box, done, failed, flip_h, flip_v
+    enroll_frame_ready = Signal()
 
-    def __init__(self, open_fn: OpenFn = open_camera, parent=None) -> None:  # type: ignore[no-untyped-def]
+    def __init__(self, open_fn: OpenFn = open_camera, parent=None,  # type: ignore[no-untyped-def]
+                 engine: FaceEngine | None = None, profile: FaceProfile | None = None) -> None:
         super().__init__(parent)
         self._open_fn = open_fn
         self._wake = threading.Event()
@@ -97,6 +111,20 @@ class CameraWorker(QThread):
 
         self.detector = MotionDetector()
 
+        # Watch my back (settings written by the GUI thread).
+        self.engine = engine or FaceEngine()
+        self.profile = profile or FaceProfile(Path(os.devnull))
+        self.tracker = PresenceTracker(self.engine, self.profile)
+        self._presence_on = False
+        self._presence_cfg: tuple = (5.0, True, 0.363, 60.0, "medium")
+        self._presence_zones: list[list[float]] = []
+        self._enroll_request: str | None = None  # "start" | "cancel"
+        self._presence_failed = False
+
+        # Second latest-frame slot, used only while enrolling a face.
+        self._enroll_latest: np.ndarray | None = None
+        self._enroll_pending = False
+
         # Latest-frame slot.
         self._slot_lock = threading.Lock()
         self._latest: np.ndarray | None = None
@@ -113,6 +141,9 @@ class CameraWorker(QThread):
         self._props_touched: set[str] = set()
         self._props_watch_until = 0.0
         self._props_next_poll = 0.0
+        self._enroller: Enroller | None = None
+        self._presence_due = 0.0
+        self._presence_key: tuple | None = None
 
     # ------------------------------------------------------------------ #
     # GUI-thread API (all cheap, thread-safe attribute writes)
@@ -154,6 +185,39 @@ class CameraWorker(QThread):
         self._monitor_hidden = monitor_hidden
         self._wake.set()
 
+    def set_presence(self, enabled: bool, dwell: float, person_trigger: bool, threshold: float,
+                     cooldown: float, sensitivity: str) -> None:
+        self._presence_cfg = (dwell, person_trigger, threshold, cooldown, sensitivity)
+        self._presence_on = enabled
+        self._presence_failed = False
+        self._wake.set()
+
+    def set_presence_zones(self, zones: list[list[float]]) -> None:
+        self._presence_zones = [list(z) for z in zones]
+
+    def set_profile(self, profile: FaceProfile) -> None:
+        """Use another profile object (e.g. after it was reloaded or forgotten)."""
+        self.profile = profile
+        self.tracker.profile = profile
+
+    def start_enroll(self) -> None:
+        self._enroll_request = "start"
+        self._presence_failed = False
+        self._wake.set()
+
+    def cancel_enroll(self) -> None:
+        self._enroll_request = "cancel"
+        self._wake.set()
+
+    @property
+    def enrolling(self) -> bool:
+        return self._enroller is not None or self._enroll_request == "start"
+
+    def take_enroll_frame(self) -> np.ndarray | None:
+        with self._slot_lock:
+            frame, self._enroll_latest, self._enroll_pending = self._enroll_latest, None, False
+        return frame
+
     def set_release_when_hidden(self, enabled: bool) -> None:
         self._release_hidden = enabled
         self._wake.set()
@@ -191,6 +255,7 @@ class CameraWorker(QThread):
             self._set_state(CamState.ERROR, "Unexpected camera error. Restart DeskGuard (details in the log).")
         finally:
             self._release()
+            self.engine.unload()
             if self._state != CamState.ERROR:
                 self._set_state(CamState.STOPPED, "")
 
@@ -313,6 +378,11 @@ class CameraWorker(QThread):
             if self._motion_enabled and self.detector.process(frame, t1):
                 self.motion_detected.emit()
 
+            if self._presence_on or self._enroll_request or self._enroller is not None:
+                self._service_presence(frame, t1)
+            elif self.engine.loaded:
+                self._stop_presence()
+
             if mode == "display":
                 self._publish(self._fit(frame))
 
@@ -336,8 +406,8 @@ class CameraWorker(QThread):
     def _mode(self) -> str:
         if self._visible:
             return "display"
-        if self._motion_enabled and self._monitor_hidden:
-            return "monitor"
+        if (self._motion_enabled and self._monitor_hidden) or self._presence_on or self.enrolling:
+            return "monitor"  # Watch my back keeps watching while the preview is hidden
         return "idle"
 
     def _open(self) -> bool:
@@ -359,6 +429,8 @@ class CameraWorker(QThread):
         self._buf = None
         self.actual_size = (cam.width, cam.height)
         self.detector.reset()
+        self.tracker.reset()
+        self._presence_key = None
         self._props_watch_until = 0.0
         if self._props:
             apply_props(cam.capture, self._props)
@@ -397,6 +469,91 @@ class CameraWorker(QThread):
                     break
             except cv2.error:
                 break
+
+    # ------------------------------------------------------------------ #
+    # Watch my back / face enrolment (worker thread)
+    # ------------------------------------------------------------------ #
+    def _service_presence(self, frame: np.ndarray, now: float) -> None:
+        request, self._enroll_request = self._enroll_request, None
+        if request == "cancel":
+            self._enroller = None
+        if self._presence_failed:
+            return
+        if not self.engine.loaded:
+            try:
+                self.engine.load()
+            except FaceEngineError as exc:
+                self._presence_failed = True
+                self._enroller = None
+                log.error("Face engine unavailable: %s", exc)
+                self.presence_changed.emit(PresenceState(error=str(exc)))
+                self.enroll_progress.emit({"progress": 0.0, "hint": str(exc), "box": None,
+                                           "done": False, "failed": True, "flip_h": False, "flip_v": False})
+                return
+        if request == "start":
+            self._enroller = Enroller(self.engine)
+
+        if self._enroller is not None:
+            self._publish_enroll_frame(frame)
+        if now < self._presence_due:
+            return
+        self._presence_due = now + 1.0 / PRESENCE_HZ
+
+        if self._enroller is not None:
+            self._enroll_step(frame, now)
+            return
+
+        dwell, person, threshold, cooldown, sensitivity = self._presence_cfg
+        self.tracker.configure(dwell, person, threshold, cooldown, sensitivity)
+        self.tracker.set_ignore_zones(self._presence_zones)
+        state = self.tracker.update(frame, now)
+        self.detector.set_dynamic_zones([list(state.me_body)] if state.me_body else [])
+        if state.alert:
+            self.watcher_alert.emit(state.kind, state.watch_seconds)
+        if state.cleared:
+            self.watcher_cleared.emit()
+        key = state.key()
+        if key != self._presence_key:
+            self._presence_key = key
+            self.presence_changed.emit(state)
+
+    def _enroll_step(self, frame: np.ndarray, now: float) -> None:
+        enroller = self._enroller
+        assert enroller is not None
+        status = enroller.update(frame, now, self.engine.detect(frame))
+        done = status.done
+        hint = status.hint
+        if done:
+            if self.profile.save(enroller.samples):
+                log.info("Face profile saved (%d samples)", len(enroller.samples))
+                self.tracker.reset()
+            else:
+                done, hint = False, "Couldn't save your face profile (see the log)."
+                status.failed = True
+        if done or status.failed:
+            self._enroller = None
+        flip_h, flip_v = self._view[0], self._view[1]
+        self.enroll_progress.emit({"progress": status.progress, "hint": hint, "box": status.box,
+                                   "done": done, "failed": status.failed, "flip_h": flip_h, "flip_v": flip_v})
+
+    def _publish_enroll_frame(self, frame: np.ndarray) -> None:
+        img = cv2.resize(frame, ENROLL_VIEW, interpolation=cv2.INTER_AREA)
+        code = flip_code(self._view[0], self._view[1])
+        if code is not None:
+            img = cv2.flip(img, code)
+        with self._slot_lock:
+            self._enroll_latest = img
+            notify = not self._enroll_pending
+            self._enroll_pending = True
+        if notify:
+            self.enroll_frame_ready.emit()
+
+    def _stop_presence(self) -> None:
+        self.engine.unload()
+        self.tracker.reset()
+        self.detector.set_dynamic_zones([])
+        self._presence_key = None
+        self.presence_changed.emit(PresenceState())
 
     def _service_settings(self) -> None:
         """Open the driver dialog on request, then poll for the user's changes."""

@@ -1,11 +1,11 @@
 ; DeskGuard installer – Inno Setup 6 script
 ; Produces dist\DeskGuard-Setup-<version>.exe from the PyInstaller output in dist\DeskGuard\.
 ; Built automatically by build.bat; to build by hand:
-;   ISCC.exe /DAppVersion=1.2.0 installer\deskguard.iss
+;   ISCC.exe /DAppVersion=1.3.0 installer\deskguard.iss
 
 #define AppName "DeskGuard"
 #ifndef AppVersion
-  #define AppVersion "1.2.0"
+  #define AppVersion "1.3.0"
 #endif
 #define AppExe "DeskGuard.exe"
 

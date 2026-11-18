@@ -139,3 +139,15 @@ def test_clearing_zones_restores_detection():
     det.set_ignore_zones([])
     feed_static(det, base, rng, 20)
     assert moving_figure(det, base, rng, x0=300, step=20) >= 1
+
+
+def test_dynamic_zones_combine_with_static_zones():
+    base, rng = scene()
+    det = MotionDetector(sensitivity="high", cooldown=0)
+    det.set_ignore_zones([[0.0, 0.0, 0.3, 1.0]])
+    det.set_dynamic_zones([[0.4, 0.2, 0.6, 0.8]])  # the user's body area
+    feed_static(det, base, rng, 20)
+    assert moving_figure(det, base, rng, x0=300) == 0  # inside the dynamic zone
+    det.set_dynamic_zones([])
+    feed_static(det, base, rng, 20, t0=5)
+    assert moving_figure(det, base, rng, x0=300, step=20, t0=10) >= 1

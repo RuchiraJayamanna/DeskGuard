@@ -51,3 +51,80 @@ def icon(status: str | None = None) -> QIcon:
             ic.addPixmap(draw_icon(size, status))
         _cache[key] = ic
     return _cache[key]
+
+
+# --------------------------------------------------------------------------- #
+# Line glyphs (Fluent-style, 1.5 px strokes) for the Settings window and toast
+# --------------------------------------------------------------------------- #
+GLYPHS = ("shield", "motion", "camera", "view", "window", "lock", "face", "eye", "check", "close", "alert")
+
+
+def _shield_path(r: QRectF):  # type: ignore[no-untyped-def]
+    from PySide6.QtGui import QPainterPath
+
+    path = QPainterPath()
+    cx, top, w, h = r.center().x(), r.top(), r.width(), r.height()
+    path.moveTo(cx, top)
+    path.cubicTo(cx + w * 0.25, top + h * 0.12, cx + w * 0.42, top + h * 0.12, cx + w * 0.42, top + h * 0.12)
+    path.lineTo(cx + w * 0.42, top + h * 0.48)
+    path.cubicTo(cx + w * 0.42, top + h * 0.75, cx + w * 0.2, top + h * 0.9, cx, top + h)
+    path.cubicTo(cx - w * 0.2, top + h * 0.9, cx - w * 0.42, top + h * 0.75, cx - w * 0.42, top + h * 0.48)
+    path.lineTo(cx - w * 0.42, top + h * 0.12)
+    path.cubicTo(cx - w * 0.42, top + h * 0.12, cx - w * 0.25, top + h * 0.12, cx, top)
+    return path
+
+
+def draw_glyph(p: QPainter, name: str, rect: QRectF, color: QColor, width: float = 1.5) -> None:
+    """Draw a simple outline icon inside `rect`."""
+    from PySide6.QtGui import QPen
+
+    p.save()
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(color, width)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    r = rect.adjusted(width, width, -width, -width)
+    x, y, w, h = r.x(), r.y(), r.width(), r.height()
+    c = r.center()
+    if name in ("shield", "lock") or name == "alert":
+        p.drawPath(_shield_path(r))
+        if name == "lock":
+            p.drawRoundedRect(QRectF(c.x() - w * 0.16, c.y() - h * 0.02, w * 0.32, h * 0.24), 1.5, 1.5)
+            p.drawArc(QRectF(c.x() - w * 0.1, c.y() - h * 0.18, w * 0.2, h * 0.26), 0, 180 * 16)
+        elif name == "alert":
+            p.drawLine(QPointF(c.x(), y + h * 0.3), QPointF(c.x(), y + h * 0.56))
+            p.drawPoint(QPointF(c.x(), y + h * 0.7))
+        else:
+            p.drawPolyline([QPointF(c.x() - w * 0.16, c.y()), QPointF(c.x() - w * 0.03, c.y() + h * 0.13),
+                            QPointF(c.x() + w * 0.18, c.y() - h * 0.12)])
+    elif name == "motion":
+        for i, k in enumerate((0.18, 0.32, 0.46)):
+            p.drawArc(QRectF(c.x() - w * k, c.y() - h * k, 2 * w * k, 2 * h * k), -45 * 16, 90 * 16)
+            p.drawArc(QRectF(c.x() - w * k, c.y() - h * k, 2 * w * k, 2 * h * k), 135 * 16, 90 * 16)
+        p.drawEllipse(c, w * 0.05, h * 0.05)
+    elif name == "camera":
+        p.drawRoundedRect(QRectF(x, y + h * 0.25, w * 0.68, h * 0.5), 3, 3)
+        p.drawPolygon([QPointF(x + w * 0.72, y + h * 0.42), QPointF(x + w, y + h * 0.28),
+                       QPointF(x + w, y + h * 0.72), QPointF(x + w * 0.72, y + h * 0.58)])
+    elif name in ("view", "eye"):
+        p.drawEllipse(QRectF(x, y + h * 0.22, w, h * 0.56))
+        p.drawEllipse(c, w * 0.15, h * 0.15)
+    elif name == "window":
+        p.drawRoundedRect(QRectF(x, y + h * 0.12, w, h * 0.76), 3, 3)
+        p.drawLine(QPointF(x, y + h * 0.32), QPointF(x + w, y + h * 0.32))
+        p.drawRoundedRect(QRectF(x + w * 0.5, y + h * 0.48, w * 0.36, h * 0.28), 1.5, 1.5)
+    elif name == "face":
+        p.drawEllipse(QRectF(x + w * 0.12, y, w * 0.76, h * 0.8))
+        p.drawPoint(QPointF(c.x() - w * 0.14, y + h * 0.34))
+        p.drawPoint(QPointF(c.x() + w * 0.14, y + h * 0.34))
+        p.drawArc(QRectF(c.x() - w * 0.16, y + h * 0.38, w * 0.32, h * 0.22), -20 * 16, -140 * 16)
+        p.drawLine(QPointF(x + w * 0.05, y + h), QPointF(x + w * 0.95, y + h))
+    elif name == "check":
+        p.drawPolyline([QPointF(x + w * 0.15, c.y()), QPointF(x + w * 0.42, y + h * 0.78),
+                        QPointF(x + w * 0.88, y + h * 0.22)])
+    elif name == "close":
+        p.drawLine(QPointF(x + w * 0.2, y + h * 0.2), QPointF(x + w * 0.8, y + h * 0.8))
+        p.drawLine(QPointF(x + w * 0.8, y + h * 0.2), QPointF(x + w * 0.2, y + h * 0.8))
+    p.restore()

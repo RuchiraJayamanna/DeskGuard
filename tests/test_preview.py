@@ -90,8 +90,10 @@ def test_app_starts_builds_menu_and_saves(qapp, tmp_path, monkeypatch):
     monkeypatch.setattr(app_mod, "CameraWorker", lambda: CameraWorker(open_fn=system.open))
     monkeypatch.setattr(app_mod, "list_cameras", lambda: ["Fake Cam A", "Fake Cam B"])
 
+    from deskguard.faces import FaceProfile
+
     store = ConfigStore(tmp_path / "config.json")
-    guard = app_mod.DeskGuardApp(qapp, store)
+    guard = app_mod.DeskGuardApp(qapp, store, profile=FaceProfile(tmp_path / "face.json"))
     guard.start()
     from tests.conftest import wait_until
     assert wait_until(qapp, lambda: guard.state == "live")
@@ -113,8 +115,8 @@ def test_app_starts_builds_menu_and_saves(qapp, tmp_path, monkeypatch):
     assert wait_until(qapp, lambda: guard.window._frame is not None)
 
     # change a setting through the same path the menu uses
-    guard._set_fps(15)
-    guard._set_opacity(85)
+    guard.set_fps(15)
+    guard.set_opacity(85)
     guard.window.move(50, 60)
     guard._save_geometry()
     saved = store.load()

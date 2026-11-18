@@ -56,6 +56,24 @@ def set_rounded_corners(hwnd: int) -> bool:
         return False  # Windows 10 or DWM unavailable
 
 
+def set_dark_title_bar(hwnd: int, dark: bool) -> bool:
+    """Match the window title bar to the app theme (Windows 10 2004+ / 11)."""
+    if not IS_WINDOWS:
+        return False
+    try:
+        dwmapi = ctypes.WinDLL("dwmapi")
+        dwmapi.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+        dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+        value = ctypes.c_int(1 if dark else 0)
+        hr = dwmapi.DwmSetWindowAttribute(
+            wintypes.HWND(hwnd), DWMWA_USE_IMMERSIVE_DARK_MODE, ctypes.byref(value), ctypes.sizeof(value)
+        )
+        return hr == 0
+    except (OSError, AttributeError):
+        return False
+
+
 def set_topmost(hwnd: int, on_top: bool) -> bool:
     """Change always-on-top without re-creating or activating the window."""
     if not IS_WINDOWS:

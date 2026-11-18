@@ -32,6 +32,9 @@ set "VPY=.venv\Scripts\python.exe"
 echo Installing dependencies...
 "%VPY%" -m pip install -r requirements.txt -r requirements-dev.txt || goto :fail
 
+rem ---- 2b. Face models (bundled; the app itself never downloads anything) --
+"%VPY%" toolsetch_models.py || ( echo Could not get the face models. & goto :fail )
+
 rem ---- 3. Tests ---------------------------------------------------------------
 echo.
 echo Running tests...

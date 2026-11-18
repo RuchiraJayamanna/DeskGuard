@@ -40,7 +40,8 @@ from PySide6.QtWidgets import QWidget
 
 from deskguard import win32
 from deskguard.config import MAX_WINDOW_H, MAX_WINDOW_W, MAX_ZONES, MIN_WINDOW_H, MIN_WINDOW_W
-from deskguard.icons import STATUS_COLORS
+from deskguard.icons import STATUS_COLORS, draw_glyph
+from deskguard.presence import PresenceState
 from deskguard.view import ViewTransform, clamp
 
 EDGE = 7           # resize grip width in px
@@ -64,6 +65,7 @@ class PreviewWindow(QWidget):
     view_changed = Signal(float, float, float)  # zoom, pan_x, pan_y
     zones_changed = Signal(object)              # list[list[float]] raw normalized
     zone_edit_finished = Signal()
+    settings_requested = Signal()
 
     def __init__(self) -> None:
         super().__init__(
@@ -108,6 +110,12 @@ class PreviewWindow(QWidget):
         self._bold = QFont(self._font)
         self._bold.setBold(True)
 
+        # Watch my back overlay (boxes in raw-frame coordinates).
+        self._presence: PresenceState | None = None
+        self._presence_on = False
+        self._alert_until = 0.0
+        self._alert_timer = QTimer(self, singleShot=True, timeout=self.update)
+
         self._motion_timer = QTimer(self)
         self._motion_timer.setSingleShot(True)
         self._motion_timer.timeout.connect(self.update)
@@ -123,6 +131,16 @@ class PreviewWindow(QWidget):
         self._state, self._message = state, message
         if state != "live":
             self._frame = None  # never show a frozen image as if it were live
+        self.update()
+
+    def set_presence(self, state: PresenceState | None, enabled: bool) -> None:
+        self._presence, self._presence_on = state, enabled
+        self.update()
+
+    def flash_alert(self, seconds: float) -> None:
+        """Highlight the watcher(s) in red for a while."""
+        self._alert_until = time.monotonic() + seconds
+        self._alert_timer.start(int(seconds * 1000) + 50)
         self.update()
 
     def show_motion(self, seconds: float = 3.0) -> None:
@@ -212,6 +230,7 @@ class PreviewWindow(QWidget):
         p.drawEllipse(QPointF(11, 11), 4.5, 4.5)
 
         self._paint_zones(p)
+        self._paint_presence(p)
 
         motion = time.monotonic() < self._motion_until
         if motion:
@@ -219,7 +238,8 @@ class PreviewWindow(QWidget):
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawRect(QRectF(r).adjusted(1.5, 1.5, -1.5, -1.5))
             p.setFont(self._bold)
-            badge = QRectF(22, 4 if not self._zone_edit else 26, 62, 15)
+            badge = QRectF(22 + (18 if self._presence_on and not self._zone_edit else 0),
+                           4 if not self._zone_edit else 26, 62, 15)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(MOTION_RED)
             p.drawRoundedRect(badge, 3, 3)
@@ -267,6 +287,63 @@ class PreviewWindow(QWidget):
                 else:
                     p.drawLine(QPointF(c.x() - 4, c.y()), QPointF(c.x() + 4, c.y()))
         p.end()
+
+    def _box_rect(self, vt: ViewTransform, box: tuple[float, float, float, float]) -> QRectF:
+        return self._zone_rect(vt, list(box))
+
+    def _paint_presence(self, p: QPainter) -> None:
+        if not self._presence_on or self._zone_edit:
+            return
+        st = self._presence
+        watching = st is not None and st.watching
+        alert = time.monotonic() < self._alert_until
+        # Shield next to the status dot: green = watching your back, red = someone there.
+        color = MOTION_RED if (watching or alert) else QColor("#22c55e")
+        if st is not None and st.error:
+            color = QColor("#9ca3af")
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 140))
+        p.drawEllipse(QPointF(29, 11), 8, 8)
+        draw_glyph(p, "shield", QRectF(23, 5, 12, 12), color, 1.4)
+
+        vt = self.transform()
+        if st is None or vt is None or self._frame is None:
+            return
+        ox, oy = vt.offset()
+        ow, oh = vt.output_size()
+        p.save()
+        p.setClipRect(QRectF(ox, oy, ow, oh))
+        if st.me_body is not None:
+            rect = self._box_rect(vt, st.me_body)
+            p.setPen(QPen(QColor(34, 197, 94, 150), 1.2, Qt.PenStyle.DashLine))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 6, 6)
+            p.setFont(self._font)
+            tag = QRectF(rect.left() + 4, rect.top() + 3, 28, 14)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(22, 101, 52, 200))
+            p.drawRoundedRect(tag, 3, 3)
+            p.setPen(QColor("white"))
+            p.drawText(tag, int(Qt.AlignmentFlag.AlignCenter), "You")
+        boxes = list(st.strangers) + ([st.person] if st.person is not None and not st.strangers else [])
+        for box in boxes:
+            rect = self._box_rect(vt, box).adjusted(-2, -2, 2, 2)
+            fill = QColor(MOTION_RED)
+            fill.setAlpha(60 if alert else 28)
+            p.setPen(QPen(MOTION_RED, 2.5 if alert else 1.6))
+            p.setBrush(fill)
+            p.drawRoundedRect(rect, 6, 6)
+        p.restore()
+        if watching and st.watch_seconds >= 1:
+            p.setFont(self._bold)
+            text = f"Watching you · {int(st.watch_seconds)} s"
+            w = p.fontMetrics().horizontalAdvance(text) + 14
+            badge = QRectF((self.width() - w) / 2, self.height() - 24, w, 17)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(MOTION_RED)
+            p.drawRoundedRect(badge, 8.5, 8.5)
+            p.setPen(QColor("white"))
+            p.drawText(badge, int(Qt.AlignmentFlag.AlignCenter), text)
 
     def _zone_rect(self, vt: ViewTransform, zone: list[float]) -> QRectF:
         x, y, w, h = zone
@@ -503,6 +580,10 @@ class PreviewWindow(QWidget):
         self.view_changed.emit(zoom, pan_x, pan_y)
         self.update()
         event.accept()
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton and not self._zone_edit:
+            self.settings_requested.emit()
 
     def contextMenuEvent(self, event) -> None:  # type: ignore[no-untyped-def]  # noqa: N802
         self.user_interacted.emit()
