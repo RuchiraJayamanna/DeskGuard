@@ -14,7 +14,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 from deskguard import APP_NAME, __version__, icons, win32
 from deskguard.camera import list_cameras
 from deskguard.camera_worker import HIDDEN_MSG, CameraWorker
-from deskguard.config import MAX_CAMERAS_WITH_PROPS, Config, ConfigStore, config_dir, log_dir
+from deskguard.config import HAND_GESTURES, MAX_CAMERAS_WITH_PROPS, Config, ConfigStore, config_dir, log_dir
 from deskguard.faces import STRICTNESS, FaceProfile
 from deskguard.presence import PresenceState
 from deskguard.preview_window import PreviewWindow
@@ -28,6 +28,18 @@ AUTO_HIDE_S = 10.0         # auto-shown preview hides again after this
 STALL_WARN_S = 4.0         # no frames for this long while live => warn
 DIAG_INTERVAL_MS = 60_000
 SCREEN_MARGIN = 16
+SNOOZE_MIN = 10
+
+GESTURE_LABELS = {
+    "palm": "Open palm", "thumbs_up": "Thumbs up", "peace": "Peace sign", "fist": "Fist",
+    "nod": "Nod", "shake": "Head shake", "look_away": "Look away",
+}
+ACTION_LABELS = {
+    "toggle_preview": "Hide / show preview", "dismiss": "Dismiss the alert",
+    "snooze": f"Snooze alerts for {SNOOZE_MIN} min", "toggle_watch": "Pause / resume Watch my back",
+    "none": "Do nothing",
+}
+PRIVACY_LABELS = {"show_desktop": "Show the desktop", "lock": "Lock the PC", "hide_preview": "Hide the preview"}
 
 STATE_LABELS = {
     "starting": "Starting",
@@ -54,6 +66,8 @@ class DeskGuardApp(QObject):
         self.presence = PresenceState()
         self._alert_active = False
         self.toast = None       # ToastWindow, created on first alert
+        self.hud = None         # HudPill, created on first gesture
+        self._snoozed_until = 0.0
         self.settings = None    # SettingsWindow, created when opened
         self.diag = diag  # --diag: log RAM/CPU every minute
 
@@ -104,6 +118,8 @@ class DeskGuardApp(QObject):
         self.worker.presence_changed.connect(self._on_presence)
         self.worker.watcher_alert.connect(self._on_watcher_alert)
         self.worker.watcher_cleared.connect(self._on_watcher_cleared)
+        self.worker.gesture.connect(self._on_gesture)
+        self.worker.gesture_progress.connect(self.window.set_gesture_progress)
 
         qapp.aboutToQuit.connect(self._shutdown)
 
@@ -132,12 +148,18 @@ class DeskGuardApp(QObject):
         self._apply_view()
         self._apply_motion()
         self._apply_presence()
+        self._apply_gestures()
         self.worker.set_release_when_hidden(cfg.release_when_hidden)
+        background = cfg.start_in_background and QSystemTrayIcon.isSystemTrayAvailable()
+        self.worker.set_visible(not background)
         self.worker.start()
 
-        self.window.show()  # does not activate / take focus
         if QSystemTrayIcon.isSystemTrayAvailable():
             self.tray.show()
+        if not background:
+            self.window.show()  # does not activate / take focus
+        else:
+            log.info("Started in background (preview hidden)")
         self._update_tray()
         self._watchdog.start()
         if self.diag:
@@ -156,6 +178,8 @@ class DeskGuardApp(QObject):
         self.tray.hide()
         if self.toast is not None:
             self.toast.hide()
+        if self.hud is not None:
+            self.hud.hide()
         if self.settings is not None:
             self.settings.close()
         if not self.worker.stop(3000):
@@ -501,6 +525,7 @@ class DeskGuardApp(QObject):
     def _apply_presence(self) -> None:
         c = self.cfg
         self.worker.set_presence_zones(c.ignore_zones)
+        self.worker.set_body_outline(c.body_outline)
         self.worker.set_presence(c.presence_enabled, c.watch_dwell_s, c.watch_person_without_face,
                                  STRICTNESS.get(c.face_strictness, STRICTNESS["normal"]),
                                  c.alert_cooldown_s, c.motion_sensitivity)
@@ -534,6 +559,9 @@ class DeskGuardApp(QObject):
             return "alert", "Someone is behind you"
         if self.state != "live" and self.window.isVisible():
             return "warning", "Waiting for the camera…"
+        if self.snoozed:
+            mins = max(1, round((self._snoozed_until - time.monotonic()) / 60))
+            return "warning", f"On – alerts snoozed for {mins} more min."
         if not self.profile.enrolled:
             return "warning", "On – set up your face so DeskGuard knows which person is you."
         if self.presence.me_face is not None:
@@ -558,6 +586,7 @@ class DeskGuardApp(QObject):
         self._update_tray()
         self.window.flash_alert(8.0)
         self._toast().show_alert(kind, seconds, self._preview_screen())
+        self.worker.set_gesture_armed(True)  # nod / shake now answer the alert
         self.status_changed.emit()
 
     def _on_watcher_cleared(self) -> None:
@@ -577,7 +606,98 @@ class DeskGuardApp(QObject):
             self.toast = ToastWindow()
             self.toast.setWindowIcon(icons.icon())
             self.toast.show_preview_requested.connect(self._show_from_toast)
+            self.toast.dismissed.connect(lambda: self.worker.set_gesture_armed(False))
         return self.toast
+
+    # ------------------------------------------------------------------ #
+    # Gestures and their actions
+    # ------------------------------------------------------------------ #
+    def _apply_gestures(self) -> None:
+        c = self.cfg
+        self.worker.set_gestures(c.hand_gestures, c.face_gestures, c.look_away_enabled, c.look_away_s)
+
+    def set_gesture_option(self, name: str, value) -> None:  # type: ignore[no-untyped-def]
+        self.set_cfg(name, value, self._apply_gestures)
+
+    def set_gesture_action(self, gesture: str, action: str) -> None:
+        self.cfg.gesture_actions = {**self.cfg.gesture_actions, gesture: action}
+        self._save()
+
+    def _on_gesture(self, name: str) -> None:
+        if name in HAND_GESTURES:
+            action = self.cfg.gesture_actions.get(name, "none")
+        else:
+            action = {"nod": "dismiss", "shake": "snooze", "look_away": "privacy"}.get(name, "none")
+        log.info("Gesture %s -> %s", name, action)
+        self.run_action(action, name)
+
+    def run_action(self, action: str, gesture: str = "") -> None:
+        glyph = "face" if gesture in ("nod", "shake", "look_away") else "hand"
+        if action == "toggle_preview":
+            if self.window.isVisible():
+                self.hide_preview()
+                self.show_hud(glyph, "Preview hidden – still watching")
+            else:
+                self._cancel_auto_hide()
+                self.show_preview()
+                self.show_hud(glyph, "Preview shown")
+        elif action == "dismiss":
+            had_alert = self.toast is not None and self.toast.isVisible() and self.toast.kind != "test"
+            self.dismiss_alert()
+            self.show_hud("check" if had_alert else glyph, "Alert dismissed" if had_alert else "No alert to dismiss")
+        elif action == "snooze":
+            self.snooze_alerts(SNOOZE_MIN)
+            self.show_hud("snooze", f"Alerts snoozed for {SNOOZE_MIN} min")
+        elif action == "toggle_watch":
+            on = not self.cfg.presence_enabled
+            self.set_cfg("presence_enabled", on, self._apply_presence)  # no Settings window from a gesture
+            self.status_changed.emit()
+            self.show_hud("shield", "Watch my back on" if on else "Watch my back paused")
+        elif action == "privacy":
+            self.privacy_action()
+
+    def privacy_action(self) -> None:
+        what = self.cfg.privacy_action
+        if what == "lock":
+            win32.lock_workstation()
+        elif what == "hide_preview":
+            self.hide_preview()
+            self.show_hud("lock", "Preview hidden for privacy")
+        else:
+            win32.show_desktop()
+            self.show_hud("lock", "Desktop shown for privacy")
+
+    def dismiss_alert(self) -> None:
+        if self.toast is not None:
+            self.toast.dismiss()
+        self.worker.set_gesture_armed(False)
+        if self._alert_active:
+            self._alert_active = False
+            self._update_tray()
+            self.status_changed.emit()
+
+    def snooze_alerts(self, minutes: float) -> None:
+        self.worker.snooze(minutes * 60)
+        self._snoozed_until = time.monotonic() + minutes * 60
+        self.dismiss_alert()
+        QTimer.singleShot(int(minutes * 60 * 1000) + 100, self.status_changed.emit)
+        self.status_changed.emit()
+
+    def resume_alerts(self) -> None:
+        self.worker.snooze(0)
+        self._snoozed_until = 0.0
+        self.status_changed.emit()
+
+    @property
+    def snoozed(self) -> bool:
+        return time.monotonic() < self._snoozed_until
+
+    def show_hud(self, glyph: str, text: str) -> None:
+        if self.hud is None:
+            from deskguard.ui.toast import HudPill
+
+            self.hud = HudPill()
+        self.hud.show_message(glyph, text, self._preview_screen())
 
     def _show_from_toast(self) -> None:
         self._cancel_auto_hide()
@@ -649,7 +769,7 @@ class DeskGuardApp(QObject):
         m.addSeparator()
 
         visible = self.window.isVisible()
-        self._action(m, "Hide preview" if visible else "Show preview",
+        self._action(m, "Run in background (hide preview)" if visible else "Show preview",
                      self.hide_preview if visible else lambda: (self._cancel_auto_hide(), self.show_preview()))
         paused = self.worker.paused
         self._action(m, "Resume camera" if paused else "Pause camera (turns camera off)",
@@ -657,6 +777,12 @@ class DeskGuardApp(QObject):
         m.addSeparator()
 
         self._action(m, "Watch my back", self.set_presence_enabled, c.presence_enabled)
+        if c.presence_enabled:
+            if self.snoozed:
+                self._action(m, "Resume alerts now", self.resume_alerts)
+            else:
+                self._action(m, f"Snooze alerts for {SNOOZE_MIN} min", partial(self.snooze_alerts, SNOOZE_MIN))
+        self._action(m, "Hand gestures", lambda on: self.set_gesture_option("hand_gestures", on), c.hand_gestures)
         self._action(m, "Motion detection", lambda on: self.set_motion_option("motion_enabled", on), c.motion_enabled)
         self._action(m, "Edit ignore zones…", self.edit_zones, enabled=self._raw_size is not None)
         self._action(m, "Mirror image", lambda on: self.set_view(flip_h=on), c.flip_h)

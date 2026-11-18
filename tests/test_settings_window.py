@@ -94,3 +94,71 @@ def test_quick_menu_is_short(qapp, guard):
     guard._build_menu()
     titles = [a.text() for a in guard.menu.actions() if a.text()]
     assert "Watch my back" in titles and "Settings…" in titles and len(titles) <= 10
+
+
+def test_gestures_page_and_actions(qapp, guard, monkeypatch):
+    calls = []
+    monkeypatch.setattr("deskguard.win32.show_desktop", lambda: calls.append("desktop") or True)
+    monkeypatch.setattr("deskguard.win32.lock_workstation", lambda: calls.append("lock") or True)
+    guard.open_settings("gestures")
+    w = guard.settings
+    w.grab()
+    w.c["hand_gestures"].click()
+    assert guard.store.load().hand_gestures is True and w.gesture_cards[0].isEnabled()
+    box = w.c["action_palm"]
+    box.setCurrentIndex(box.findData("snooze"))
+    assert guard.store.load().gesture_actions["palm"] == "snooze"
+    w._on_gesture_progress("fist", 0.5)
+    assert "Fist" in w.gesture_live.text.text()
+    w._on_gesture_seen("thumbs_up")
+    assert "Thumbs up" in w.gesture_live.text.text()
+
+    # palm is now mapped to snooze
+    guard.cfg.presence_enabled = True
+    guard._on_gesture("palm")
+    assert guard.snoozed and guard.worker.snoozed and guard.hud is not None and "snoozed" in guard.hud.text
+    guard.resume_alerts()
+    assert not guard.snoozed
+    # thumbs up dismisses an alert, nod too
+    guard._on_watcher_alert("face", 6)
+    assert guard.worker._armed
+    guard._on_gesture("thumbs_up")
+    assert not guard.toast.isVisible() and not guard._alert_active and not guard.worker._armed
+    guard._on_watcher_alert("face", 6)
+    guard._on_gesture("nod")
+    assert not guard.toast.isVisible()
+    # fist toggles Watch my back without opening anything
+    before = guard.cfg.presence_enabled
+    guard._on_gesture("fist")
+    assert guard.cfg.presence_enabled is (not before)
+    # look away -> chosen privacy action
+    guard._on_gesture("look_away")
+    guard.set_gesture_option("privacy_action", "lock")
+    guard._on_gesture("look_away")
+    assert calls == ["desktop", "lock"]
+    guard.tray.show()
+    guard.set_gesture_option("privacy_action", "hide_preview")
+    guard._on_gesture("look_away")
+    assert not guard.window.isVisible()
+
+
+def test_start_in_background(qapp, tmp_path, monkeypatch):
+    from deskguard import app as app_mod
+    from deskguard.camera_worker import CameraWorker
+    from tests.test_camera import FakeCameraSystem
+
+    system = FakeCameraSystem()
+    monkeypatch.setattr(app_mod, "CameraWorker", lambda: CameraWorker(open_fn=system.open))
+    monkeypatch.setattr(app_mod, "list_cameras", lambda: ["Fake Cam A"])
+    monkeypatch.setattr(app_mod.QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: True))
+    store = ConfigStore(tmp_path / "config.json")
+    cfg = store.load()
+    cfg.start_in_background = True
+    store.save(cfg)
+    g = app_mod.DeskGuardApp(qapp, store, profile=FaceProfile(tmp_path / "face.json"))
+    g.start()
+    try:
+        assert wait_until(qapp, lambda: g.state == "live")
+        assert not g.window.isVisible() and not g.worker._visible
+    finally:
+        g.worker.stop()

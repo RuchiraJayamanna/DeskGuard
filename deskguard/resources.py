@@ -15,7 +15,11 @@ def resource_path(*parts: str) -> Path:
 
 YUNET_MODEL = ("models", "face_detection_yunet_2023mar.onnx")
 SFACE_MODEL = ("models", "face_recognition_sface_2021dec_int8.onnx")
+SEG_MODEL = ("models", "human_segmentation_pphumanseg_2023mar.onnx")
+PALM_MODEL = ("models", "palm_detection_mediapipe_2023feb.onnx")
+HAND_MODEL = ("models", "handpose_estimation_mediapipe_2023feb.onnx")
 
 
-def models_available() -> bool:
-    return resource_path(*YUNET_MODEL).is_file() and resource_path(*SFACE_MODEL).is_file()
+def models_available(*models: tuple[str, str]) -> bool:
+    """True if all given models (default: the two face models) are bundled."""
+    return all(resource_path(*m).is_file() for m in (models or (YUNET_MODEL, SFACE_MODEL)))

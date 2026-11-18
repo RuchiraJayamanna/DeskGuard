@@ -12,6 +12,10 @@ cubicle partition and see who's approaching without turning around.
   **Ignore zones** let you draw over yourself so only the background (people approaching) triggers it.
 - **Watch my back** (optional): DeskGuard learns your face, ignores you automatically, and shows a silent
   notification – *"Someone is watching you"* – when another person stays behind you for 5 seconds.
+- **Body outlines:** you and anyone behind you are traced as real body shapes, not rectangles.
+- **Gestures** (optional): hand gestures (open palm, thumbs up, peace sign, fist) and head gestures (nod,
+  shake, look away) control DeskGuard – only *your* hand and face count.
+- **Background mode:** hide the preview and DeskGuard keeps watching from the tray (camera stays on).
 - A Windows 11-style **Settings** window (dark/light, follows Windows), plus a short right-click menu for quick actions.
 - Everything stays private: no recording, no screenshots, no audio, no network. Frames exist only in memory;
   your face is stored only as numbers (never a photo) and can be deleted at any time.
@@ -85,38 +89,68 @@ antivirus false positives.
 1. Right-click the preview → **Watch my back** (or Settings → Watch my back → switch on).
 2. The first time, DeskGuard opens **face setup**: sit as usual and look at the camera. It takes about
    5 seconds and asks you to turn your head slightly. Only numbers that describe your face are saved.
-3. That's it. The preview shows a dashed green **You** outline around your body area, and a red box
-   around anyone else. If someone stays behind you for the set time (default **5 s**), a notification
+3. That's it. The preview shows your body shape in green (**You**) and anyone else's in red. If someone stays behind you for the set time (default **5 s**), a notification
    slides in at the bottom-right: **"Someone is watching you"**, with **Show preview** and **Dismiss**.
    It is silent, never takes your keyboard, and closes about 6 s after they leave.
 
 How it decides:
 - **Faces:** every face is compared with yours. A face that isn't yours counts as "someone behind you".
-- **People without a visible face** (optional, on by default): a person-shaped change against the empty
-  background, outside your body area, also counts – so someone looking away is still noticed.
-- **You:** your body area is worked out from where your face is. It stays put when you look down or turn
-  away, so your own movement never triggers an alert (or the MOTION border).
+- **People without a visible face** (optional, on by default): any other person's body outline also
+  counts – so someone looking away is still noticed.
+- **You:** your body outline is the person shape that touches your recognised face (a torso that shows up
+  separately just below your face is yours too). It stays when you look down or turn away, so your own
+  movement never triggers an alert or the MOTION border. Anything above your head – someone standing
+  right behind you – is split off and counts as another person.
+- **Body outline** can be switched off (Settings → Watch my back) to save about 35 MB of memory; DeskGuard
+  then uses a rectangle around you and a background-difference check, as in version 1.3.
 - People walking past are ignored: the person must stay for the whole delay (short gaps are tolerated).
   After an alert, the next one waits for the cooldown (default 1 minute).
 - Watch my back keeps working while the preview is hidden. Until your face is set up, the person
   closest to the camera is treated as you.
 
+### Background mode
+
+Right-click → **Run in background (hide preview)**, or left-click the tray icon. The camera stays on
+(its light too), and Watch my back, gestures and alerts keep working; the tray icon turns red during an
+alert. Settings → Window & app → **Start in background** starts DeskGuard this way every time.
+
+### Gestures
+
+Settings → **Gestures**. All off by default. Only *your* hand (near your body) and *your* recognised face
+count, so people behind you can't trigger anything. A small silent pill at the bottom-right confirms each
+gesture, and the preview shows a ring while you hold a hand gesture.
+
+| Gesture | How | Default action (changeable) |
+|---|---|---|
+| ✋ Open palm | Hold towards the camera ~1 s | Hide / show the preview |
+| 👍 Thumbs up | Hold ~1 s | Dismiss the alert |
+| ✌ Peace sign | Hold ~1 s | Snooze alerts for 10 minutes |
+| ✊ Fist | Hold ~1.5 s | Pause / resume Watch my back |
+| Nod | While an alert is showing | Dismiss the alert |
+| Shake your head | While an alert is showing | Snooze alerts for 10 minutes |
+| Look away | Turn your head away for 1/2/3 s (opt-in) | Show the desktop (Win+D), lock the PC, or hide the preview |
+
+Looking down at the keyboard doesn't count as looking away. Each gesture fires once; hold it again (after
+a short pause) to repeat. Nod and shake do nothing unless an alert is on screen.
+
 ### Settings window
 
 | Page | Options |
 |---|---|
-| Watch my back | On/off · Your face (set up, set up again, forget) · Alert after 3/5/10/15 s · Also detect people whose face isn't visible · Face matching relaxed/normal/strict · Don't repeat alerts within 30 s–5 min · Test alert |
+| Watch my back | On/off · Your face (set up, set up again, forget) · Alert after 3/5/10/15 s · Also detect people whose face isn't visible · Body outline · Face matching relaxed/normal/strict · Don't repeat alerts within 30 s–5 min · Test alert |
+| Gestures | Hand gestures on/off and the action for each gesture · Nod and shake · Look away for privacy (delay, action) · Try it (shows what DeskGuard sees) |
 | Motion | Motion detection · Sensitivity · Wait between alerts · Ignore zones (edit on preview, clear) · Keep monitoring while hidden · Show the preview on motion |
 | Camera | Camera (by name; listing never opens a camera) · Resolution 640×360 (recommended) / 848×480 / 1280×720 / 1920×1080 / 640×480 · Frame rate 10/15 fps · Camera settings… (driver dialog) · Forget saved camera settings · Pause camera · Turn the camera off when hidden |
 | View | Mirror (on by default) · Flip upside-down · Rotate 180° · Digital zoom 1–4× · Fill the window |
-| Window & app | Always on top · Opacity · Theme (Windows setting / dark / light) · Start with Windows · Reset preview position · Log folder |
+| Window & app | Start in background · Always on top · Opacity · Theme (Windows setting / dark / light) · Start with Windows · Reset preview position · Log folder |
 | Privacy | What is stored and where · Delete my face data |
 
 The Settings window is created when you open it and destroyed when you close it, so it uses no memory
 the rest of the time.
 
-**Right-click menu (quick actions):** status · Hide/Show preview · Pause camera · Watch my back ·
-Motion detection · Edit ignore zones… · Mirror image · Settings… · Exit.
+**Right-click menu (quick actions):** status · Run in background / Show preview · Pause camera ·
+Watch my back · Snooze alerts for 10 min (or Resume alerts) · Hand gestures · Motion detection ·
+Edit ignore zones… · Mirror image · Settings… · Exit.
 
 **While hidden:**
 - *Monitoring off (default):* the camera stays open but no frames are read (≈0.3 % CPU).
@@ -163,14 +197,18 @@ Camera worker thread                         GUI thread
    ├ retrieve() only at 10/15 fps
    ├ motion: 160×120 grey diff (if enabled; your body area masked out)
    ├ Watch my back, 3×/s (if enabled): YuNet faces → SFace "is it me?" →
-   │   your body area + strangers + still-person check → alert after the delay
+   │   PP-HumanSeg person mask → your outline + other people → alert after the delay
+   ├ hand gestures, 6×/s (if enabled): palm detector (only while no hand is
+   │   followed, 2.5×/s) → 21 hand points → pose → held long enough? → action
+   ├ head gestures, 10×/s (if enabled): YuNet on a small crop around your face
+   │   → yaw/pitch → nod / shake / look away
    ├ zoom/pan = slice of the frame (no copy), resize to the window's pixel size, flip
    └ ──► latest-frame slot (max 1 frame) ──► frame_ready
 ```
 
-There are two threads in total. The face models (`resources/models`, ~10 MB,
-see `LICENSES.md` there) are loaded only while Watch my back or face setup is
-in use, and unloaded when it's turned off. Recognition runs only for a new face
+There are two threads in total. The models (`resources/models`, ~24 MB in
+total, see `LICENSES.md` there) are each loaded only while the feature that
+needs them is on, and unloaded when it's turned off. Recognition runs only for a new face
 and then every 3 s per face, not on every frame. If the GUI is busy, frames are replaced, never queued.
 OpenCV and OpenBLAS are limited to one thread each (`main.py`), and OpenCL is off.
 When the requested size is the camera's default, no format property is
@@ -183,7 +221,9 @@ through IAMVideoProcAmp/IAMCameraControl and don't rebuild the graph.
 | `main.py` | Logging, single-instance lock, error dialogs, OpenCV/OpenBLAS thread and environment settings |
 | `deskguard/app.py` | Wiring: window ↔ worker ↔ tray ↔ menu ↔ Settings window ↔ toast; show/hide; stall watchdog |
 | `deskguard/faces.py` | Face engine (YuNet + SFace, lazy load/unload), your face profile, guided enrolment |
-| `deskguard/presence.py` | Watch my back logic: face tracks, your body area, still-person check, alert timing |
+| `deskguard/presence.py` | Watch my back logic: face tracks, your outline vs. other people, alert timing |
+| `deskguard/segmentation.py` | Person outlines (PP-HumanSeg), mask → outline helpers |
+| `deskguard/gestures.py` | Hand models (palm + landmarks), hand pose classifier, hold/debounce, head gestures |
 | `deskguard/ui/` | Fluent theme, widgets (toggle switch, cards, progress ring), Settings window, face setup, toast |
 | `deskguard/preview_window.py` | Frameless no-focus window, painting, manual drag/resize, hover buttons, zone editing, Ctrl+wheel zoom / Ctrl+drag pan |
 | `deskguard/view.py` | Pure geometry: zoom/pan/crop/flip, preview ↔ camera-frame mapping |
@@ -211,7 +251,7 @@ through IAMVideoProcAmp/IAMCameraControl and don't rebuild the graph.
 python -m pytest -q
 ```
 
-There are 103 tests across nine files:
+There are 133 tests across eleven files:
 
 | File | What it covers |
 |---|---|
@@ -222,6 +262,8 @@ There are 103 tests across nine files:
 | `test_presence.py` | Stranger alerts once after the delay, your face never alerts, passers-by ignored, flicker tolerated, cooldown, body area kept when your face disappears, still person without a face, person inside your area ignored, lighting change, no-profile fallback |
 | `test_faces.py` | Face profile save/load/forget (numbers only), match thresholds, enrolment rules and timeout, real models load → detect → unload |
 | `test_toast.py` | No-focus flags, live seconds, auto-close after the person leaves, buttons |
+| `test_segmentation.py` | Your outline is a body shape (not a box), kept when your face disappears, torso split from the head is still yours, someone right behind you is split off, other people alert, zones respected, MOTION ignores your exact shape, real model runs |
+| `test_gestures.py` | Palm / fist / thumbs up / peace / pointing from 21 points (also mirrored and scaled), hold time, flicker, refractory, only the user's hand counts, nod and shake only when armed, look away after the delay but not looking down, real hand models run |
 | `test_settings_window.py` | Every page paints, controls save settings, outside changes show up, theme switch, window destroyed on close, first-time face setup, alert → toast, short quick menu |
 | `test_preview.py` | No-focus window flags, painting, drag/resize/minimum size, buttons, full app start → menu → hide/show → settings saved, drawing/deleting ignore zones (with mirror), Ctrl+wheel zoom, Ctrl+drag pan |
 
@@ -264,6 +306,24 @@ written to the log 10 s after start and then every minute. Task Manager's
 ---
 
 ## 6. Measured performance
+
+**Version 1.4.0** – synthetic 30 fps camera (so the camera driver's own cost, ≈0.3–0.5 %, is not included),
+a simulated face for "you" (so the face models' cost, measured in 1.3 as ≈+0.4 % CPU and +16 MB, is not
+included either), real outline and hand models, 20 s per phase, running from source:
+
+| Phase | CPU | Private | Working set |
+|---|---|---|---|
+| Everything off | 0.53 % | 60.6 MB | 92.2 MB |
+| Watch my back with body outline | 1.47 % | 97.0 MB | 133.8 MB |
+| Watch my back, body outline off | 0.63 % | 62.5 MB | 100.6 MB |
+| + hand gestures (searching for a hand: worst case) | 2.75 % | 116.0 MB | 153.8 MB |
+| + face gestures and look away | 2.70 % | 116.0 MB | 153.9 MB |
+| Everything on, preview hidden (background mode) | 1.88 % | 115.9 MB | 153.9 MB |
+| Everything off again (models unloaded) | 0.64 % | 62.8 MB | 101.1 MB |
+
+Per check on this CPU (one thread): body outline ≈29 ms (3×/s), palm detector ≈45 ms (2.5×/s, only
+while no hand is followed), hand points ≈21 ms (6×/s while a hand is followed), face detection ≈20 ms.
+Not yet measured: a real person in front of the camera, and a 30-minute run with everything on.
 
 **Version 1.3.0** – HP Wide Vision HD Camera, 640×360, 10 fps, preview visible, running from source
 (scripted run on this PC, 15–30 s per phase; CPU is % of the whole machine):
@@ -309,11 +369,18 @@ shrank from 184 MB to 152 MB.
 
 ## 7. Known limitations
 
+- **Gestures** need your hand clearly in view, in reasonable light, held still for about a second. Hand
+  gestures are the heaviest feature (see *Measured performance*), so they are off by default.
+- **Look away** can't tell "turned to talk to someone" from "turned to look at another monitor" – that's
+  why it is opt-in with an adjustable delay.
+- **Body outlines** cover people only: a large object moved behind you is no longer reported (with the
+  outline switched off, the older background check may report it until it fades in about a minute).
+- If someone stands directly behind you and their body merges with yours below your head line, that
+  part is treated as you; their face (or anything above your head) still gets them noticed.
+
 - **Watch my back** needs reasonable light and a mostly frontal face to recognise faces. Someone
   standing in profile is caught only by the "person without a visible face" check.
-- That check can raise a false alert when something large is moved behind you (a chair, a door left
-  open), until it becomes part of the background after about a minute.
-- Your body area follows your face. If you leave and someone else sits in your seat with their face
+- Your body outline follows your face. If you leave and someone else sits in your seat with their face
   hidden, they are treated as you until a face is seen.
 - If someone stands directly behind you, most of them is inside your body area; their face (usually
   above yours) is what gets them noticed.
@@ -350,6 +417,8 @@ shrank from 184 MB to 152 MB.
 | 1080p is choppy | Use 640×360. The preview is tiny, so higher resolutions only cost CPU and USB bandwidth. |
 | Image is mirrored the wrong way | Right-click → Mirror image (toggle). |
 | Motion alerts when I move | Turn on Watch my back, or right-click → Edit ignore zones… and draw over yourself. |
+| A gesture isn't recognised | Settings → Gestures → *Try it* shows what DeskGuard sees. Face the palm to the camera, keep the hand near your body, and hold still for a second. |
+| Gestures fire by accident | Change that gesture's action to *Do nothing*, or turn hand gestures off. |
 | Alerts about me | Settings → Watch my back → Your face → **Set up again** in your usual light, or set Face matching to *Relaxed*. |
 | No alert when someone stands behind me | Check the delay (Settings → Watch my back), that their face is lit, and that "Also detect people whose face isn't visible" is on. |
 | Face setup says "Only one face" | Make sure nobody else is in view while you set it up. |

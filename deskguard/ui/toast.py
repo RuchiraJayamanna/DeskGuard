@@ -286,3 +286,68 @@ class ToastWindow(QWidget):
         self.update()
         if self.isVisible() and (not self._present or self.kind == "test"):
             self._close_timer.start(int(CLOSE_AFTER_LEFT_S * 1000))
+
+
+class HudPill(QWidget):
+    """Short, silent confirmation of a gesture ("✋ Preview hidden"), bottom-right.
+
+    Same no-focus window flags as the toast. Disappears after ~1.6 s."""
+
+    HEIGHT = 40
+
+    def __init__(self) -> None:
+        super().__init__(
+            None,
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+            | Qt.WindowType.WindowTransparentForInput,
+        )
+        self.setWindowTitle("DeskGuard")
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.glyph, self.text = "hand", ""
+        self._font = QFont(self.font())
+        self._font.setPixelSize(14)
+        self._font.setWeight(QFont.Weight.DemiBold)
+        self._hide_timer = QTimer(self, singleShot=True, interval=1600, timeout=self.hide)
+
+    def show_message(self, glyph: str, text: str, screen: QRect | None = None) -> None:
+        from PySide6.QtGui import QFontMetrics, QGuiApplication
+
+        self.glyph, self.text = glyph, text
+        width = QFontMetrics(self._font).horizontalAdvance(text) + 76
+        self.setFixedSize(width, self.HEIGHT + 2 * 8)
+        if screen is None:
+            primary = QGuiApplication.primaryScreen()
+            screen = primary.availableGeometry() if primary else QRect(0, 0, 1280, 720)
+        self.move(screen.right() - self.width() - SCREEN_MARGIN + 1, screen.bottom() - self.height() - 24)
+        self.setWindowOpacity(1.0)
+        self.show()
+        self.update()
+        self._hide_timer.start()
+
+    def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802
+        pal = theme.current()
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(8, 8, self.width() - 16, self.HEIGHT)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 40))
+        p.drawRoundedRect(r.adjusted(-2, 0, 2, 4), 22, 22)
+        p.setBrush(QColor(pal.card if pal.dark else "#ffffff"))
+        p.setPen(QPen(pal.q("stroke"), 1))
+        p.drawRoundedRect(r, 20, 20)
+        badge = QRectF(r.left() + 8, r.top() + 6, 28, 28)
+        tint = QColor(pal.accent)
+        tint.setAlphaF(0.18)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(tint)
+        p.drawEllipse(badge)
+        draw_glyph(p, self.glyph, badge.adjusted(6, 6, -6, -6), QColor(pal.accent), 1.6)
+        p.setPen(pal.q("text"))
+        p.setFont(self._font)
+        p.drawText(r.adjusted(46, 0, -14, 0), int(Qt.AlignmentFlag.AlignVCenter), self.text)
+        p.end()

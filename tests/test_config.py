@@ -78,7 +78,7 @@ def test_v1_defaults_migrate_to_wide_view():
     old = {"width": 640, "height": 480, "window_w": 240, "window_h": 150, "fps": 15}
     cfg = from_dict(old)
     assert (cfg.width, cfg.height, cfg.window_w, cfg.window_h, cfg.fps) == (640, 360, 256, 144, 15)
-    assert cfg.flip_h is True and cfg.config_version == 3
+    assert cfg.flip_h is True and cfg.config_version == 4
     assert old["width"] == 640 and old["height"] == 480  # input not mutated
 
 
@@ -104,3 +104,18 @@ def test_watch_my_back_fields():
                      "presence_enabled": "yes", "config_version": 3})
     assert (bad.watch_dwell_s, bad.face_strictness, bad.alert_cooldown_s, bad.theme, bad.presence_enabled) == (
         5, "normal", 60, "system", False)
+
+
+def test_gesture_fields():
+    d = Config()
+    assert (d.hand_gestures, d.face_gestures, d.look_away_enabled, d.look_away_s, d.privacy_action,
+            d.start_in_background) == (False, False, False, 2, "show_desktop", False)
+    assert d.gesture_actions == {"palm": "toggle_preview", "thumbs_up": "dismiss", "peace": "snooze",
+                                 "fist": "toggle_watch"}
+    cfg = from_dict({"gesture_actions": {"palm": "none"}, "look_away_s": 3, "privacy_action": "lock",
+                     "config_version": 4})
+    assert cfg.gesture_actions["palm"] == "none" and cfg.gesture_actions["fist"] == "toggle_watch"
+    assert (cfg.look_away_s, cfg.privacy_action) == (3, "lock")
+    bad = from_dict({"gesture_actions": {"wave": "dismiss"}, "look_away_s": 9, "privacy_action": "format_c",
+                     "config_version": 4})
+    assert bad.gesture_actions == d.gesture_actions and bad.look_away_s == 2 and bad.privacy_action == "show_desktop"

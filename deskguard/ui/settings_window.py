@@ -36,6 +36,10 @@ from deskguard.config import (
     OPACITY_CHOICES,
     RESOLUTIONS,
     SENSITIVITY_CHOICES,
+    GESTURE_ACTIONS,
+    HAND_GESTURES,
+    LOOK_AWAY_CHOICES,
+    PRIVACY_ACTIONS,
     config_dir,
     log_dir,
 )
@@ -45,6 +49,7 @@ from deskguard.ui.widgets import GlyphLabel, InfoBar, NavButton, SettingCard, To
 
 PAGES = (
     ("watch", "shield", "Watch my back"),
+    ("gestures", "hand", "Gestures"),
     ("motion", "motion", "Motion"),
     ("camera", "camera", "Camera"),
     ("view", "view", "View"),
@@ -98,6 +103,7 @@ class SettingsWindow(QWidget):
 
         self.pages: dict[str, QWidget] = {
             "watch": self._page_watch(),
+            "gestures": self._page_gestures(),
             "motion": self._page_motion(),
             "camera": self._page_camera(),
             "view": self._page_view(),
@@ -112,6 +118,8 @@ class SettingsWindow(QWidget):
 
         app.changed.connect(self.sync)
         app.status_changed.connect(self._sync_status)
+        app.worker.gesture_progress.connect(self._on_gesture_progress)
+        app.worker.gesture.connect(self._on_gesture_seen)
         self.apply_theme()
         self.sync()
         self.show_page("watch")
@@ -256,6 +264,10 @@ class SettingsWindow(QWidget):
             "with an occasional false alarm (e.g. a moved chair).",
             self._toggle("watch_person_without_face", lambda on: app.set_presence_option("watch_person_without_face", on))))
         col.addWidget(SettingCard(
+            "view", "Body outline", "Trace the real shape of you and of anyone behind you, instead of a "
+            "rectangle. More accurate; uses about 35 MB more memory.",
+            self._toggle("body_outline", lambda on: app.set_presence_option("body_outline", on))))
+        col.addWidget(SettingCard(
             "face", "Face matching", "Strict avoids mistaking others for you; relaxed copes better with poor light.",
             self._combo("face_strictness", [("Relaxed", "relaxed"), ("Normal", "normal"), ("Strict", "strict")],
                         lambda v: app.set_presence_option("face_strictness", v))))
@@ -356,9 +368,66 @@ class SettingsWindow(QWidget):
         self._finish(col)
         return area
 
+    def _page_gestures(self) -> QWidget:
+        from deskguard.app import ACTION_LABELS, GESTURE_LABELS, PRIVACY_LABELS
+
+        app = self.app
+        area, col = self._page("Gestures", "Control DeskGuard without touching the PC. Only your own hand and "
+                                           "face count – gestures from people behind you are ignored.")
+        col.addWidget(SettingCard("hand", "Hand gestures", "Hold the gesture towards the camera for about a "
+                                  "second. Uses a little more CPU while on.",
+                                  self._toggle("hand_gestures", lambda on: app.set_gesture_option("hand_gestures", on))))
+        hold = {"palm": "hold 1 s", "thumbs_up": "hold 1 s", "peace": "hold 1 s", "fist": "hold 1.5 s"}
+        icons_ = {"palm": "✋", "thumbs_up": "👍", "peace": "✌", "fist": "✊"}
+        self.gesture_cards: list[SettingCard] = []
+        for g in HAND_GESTURES:
+            card = SettingCard(None, f"{icons_[g]}  {GESTURE_LABELS[g]}", hold[g],
+                               self._combo(f"action_{g}", [(ACTION_LABELS[a], a) for a in GESTURE_ACTIONS],
+                                           lambda v, g=g: app.set_gesture_action(g, v)))
+            self.gesture_cards.append(card)
+            col.addWidget(card)
+        col.addWidget(label("Face gestures", "section"))
+        col.addWidget(SettingCard("face", "Nod and shake", "While the 'Someone is watching you' alert is showing: "
+                                  "nod to dismiss it, shake your head to snooze alerts for 10 minutes.",
+                                  self._toggle("face_gestures", lambda on: app.set_gesture_option("face_gestures", on))))
+        col.addWidget(SettingCard("lock", "Look away for privacy", "When you turn your head away from the screen "
+                                  "(not when you look down at the keyboard).",
+                                  self._toggle("look_away_enabled",
+                                               lambda on: app.set_gesture_option("look_away_enabled", on))))
+        self.look_away_cards = [
+            SettingCard(None, "After", "", self._combo("look_away_s", [(f"{s} second{'s' if s > 1 else ''}", s)
+                                                                       for s in LOOK_AWAY_CHOICES],
+                                                       lambda v: app.set_gesture_option("look_away_s", v))),
+            SettingCard(None, "Then", "", self._combo("privacy_action", [(PRIVACY_LABELS[a], a) for a in PRIVACY_ACTIONS],
+                                                      lambda v: app.set_gesture_option("privacy_action", v))),
+        ]
+        for card in self.look_away_cards:
+            col.addWidget(card)
+        col.addWidget(label("Try it", "section"))
+        self.gesture_live = InfoBar("info", "Turn on hand or face gestures, then try one in front of the camera.")
+        col.addWidget(self.gesture_live)
+        self._finish(col)
+        return area
+
+    def _on_gesture_progress(self, pose: str, progress: float) -> None:
+        from deskguard.app import GESTURE_LABELS
+
+        if pose:
+            self.gesture_live.set("info", f"Seeing: {GESTURE_LABELS.get(pose, pose)} – keep holding "
+                                          f"({round(progress * 100)}%)")
+
+    def _on_gesture_seen(self, name: str) -> None:
+        from deskguard.app import GESTURE_LABELS
+
+        self.gesture_live.set("success", f"Recognised: {GESTURE_LABELS.get(name, name)} ✓")
+
     def _page_window(self) -> QWidget:
         app = self.app
         area, col = self._page("Window & app")
+        col.addWidget(SettingCard("shield", "Start in background", "Start with the preview hidden. The camera "
+                                  "stays on and Watch my back, gestures and alerts keep working from the tray.",
+                                  self._toggle("start_in_background",
+                                               lambda on: app.set_cfg("start_in_background", on))))
         col.addWidget(SettingCard("window", "Always on top", "Keep the preview above other windows.",
                                   self._toggle("always_on_top", app.set_on_top)))
         col.addWidget(SettingCard(None, "Preview opacity", "",
@@ -470,12 +539,20 @@ class SettingsWindow(QWidget):
         self._syncing = True
         try:
             for key in ("presence_enabled", "watch_person_without_face", "motion_enabled", "monitor_while_hidden",
-                        "show_on_motion", "release_when_hidden", "flip_h", "flip_v", "crop_to_fill", "always_on_top"):
+                        "show_on_motion", "release_when_hidden", "flip_h", "flip_v", "crop_to_fill", "always_on_top",
+                        "hand_gestures", "face_gestures", "look_away_enabled", "start_in_background",
+                        "body_outline"):
                 self.c[key].setChecked(bool(getattr(c, key)))
             for key in ("watch_dwell_s", "face_strictness", "alert_cooldown_s", "motion_sensitivity",
-                        "motion_cooldown", "fps", "opacity", "theme"):
+                        "motion_cooldown", "fps", "opacity", "theme", "look_away_s", "privacy_action"):
                 self._set_combo(self.c[key], getattr(c, key))
             self._set_combo(self.c["resolution"], (c.width, c.height))
+            for g in HAND_GESTURES:
+                self._set_combo(self.c[f"action_{g}"], c.gesture_actions.get(g, "none"))
+            for card in self.gesture_cards:
+                card.setEnabled(c.hand_gestures)
+            for card in self.look_away_cards:
+                card.setEnabled(c.look_away_enabled)
             self.c["paused"].setChecked(app.worker.paused)
             if "autostart" in self.c:
                 self.c["autostart"].setChecked(win32.autostart_enabled())

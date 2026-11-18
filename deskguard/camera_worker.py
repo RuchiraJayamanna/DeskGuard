@@ -11,6 +11,8 @@ Responsibilities
   changed there, re-applying it whenever the camera is opened.
 - "Watch my back" (optional): run the PresenceTracker a few times per second,
   and face enrolment on request. Face models are loaded only while needed.
+- Gestures (optional): the user's hand gestures and head gestures (nod,
+  shake, look away). Their models are loaded only while enabled.
 - Recover from disconnects with a backoff, never crashing the app.
 - Optionally release the camera (light off, ~0 CPU) after the preview has been
   hidden for IDLE_RELEASE_S with nothing to monitor; reopen when shown again.
@@ -45,13 +47,18 @@ from deskguard.camera import (
     read_props,
 )
 from deskguard.faces import Enroller, FaceEngine, FaceEngineError, FaceProfile
+from deskguard.gestures import HandModels, HandTracker, HeadGestureTracker, head_pose
 from deskguard.motion import MotionDetector
-from deskguard.presence import PresenceState, PresenceTracker
+from deskguard.presence import PresenceState, PresenceTracker, iou
+from deskguard.segmentation import PersonSegmenter
 from deskguard.view import ViewTransform, flip_code
 
 log = logging.getLogger(__name__)
 
 MONITOR_FPS = 5           # detection rate while the preview is hidden
+GESTURE_MONITOR_FPS = 10  # ...when gestures are on (they need a faster rate)
+HAND_HZ = 6.0             # hand landmark rate (palm detection itself is slower)
+HEAD_HZ = 10.0            # head gesture rate (YuNet on a small crop around the face)
 FAILS_BEFORE_DISCONNECT = 5
 STALL_SECONDS = 3.0       # no good frame for this long => treat as disconnected
 RETRY_MIN, RETRY_MAX = 2.0, 10.0
@@ -88,9 +95,12 @@ class CameraWorker(QThread):
     watcher_cleared = Signal()
     enroll_progress = Signal(object)       # dict: progress, hint, box, done, failed, flip_h, flip_v
     enroll_frame_ready = Signal()
+    gesture = Signal(str)                  # palm, thumbs_up, peace, fist, nod, shake, look_away
+    gesture_progress = Signal(str, float)  # pose being held ("" = none), 0..1
 
     def __init__(self, open_fn: OpenFn = open_camera, parent=None,  # type: ignore[no-untyped-def]
-                 engine: FaceEngine | None = None, profile: FaceProfile | None = None) -> None:
+                 engine: FaceEngine | None = None, profile: FaceProfile | None = None,
+                 segmenter: PersonSegmenter | None = None, hand_models: HandModels | None = None) -> None:
         super().__init__(parent)
         self._open_fn = open_fn
         self._wake = threading.Event()
@@ -114,7 +124,17 @@ class CameraWorker(QThread):
         # Watch my back (settings written by the GUI thread).
         self.engine = engine or FaceEngine()
         self.profile = profile or FaceProfile(Path(os.devnull))
-        self.tracker = PresenceTracker(self.engine, self.profile)
+        self.segmenter = segmenter or PersonSegmenter()
+        self.tracker = PresenceTracker(self.engine, self.profile, segmenter=self.segmenter)
+        self.hand_models = hand_models or HandModels()
+        self.hand_tracker = HandTracker(self.hand_models)
+        self.head_tracker = HeadGestureTracker()
+        self._gestures: tuple[bool, bool, bool, float] = (False, False, False, 2.0)  # hand, face, look away, s
+        self._armed = False            # an alert is showing: nod / shake answer it
+        self._snooze_until = 0.0       # monotonic time until which alerts are not sent
+        self._seg_failed = False
+        self._hand_failed = False
+        self._outline_on = True       # person segmentation for body outlines
         self._presence_on = False
         self._presence_cfg: tuple = (5.0, True, 0.363, 60.0, "medium")
         self._presence_zones: list[list[float]] = []
@@ -144,6 +164,10 @@ class CameraWorker(QThread):
         self._enroller: Enroller | None = None
         self._presence_due = 0.0
         self._presence_key: tuple | None = None
+        self._hand_due = 0.0
+        self._head_due = 0.0
+        self._head_box = None          # last known box of the user's face, for the head crop
+        self._progress_sent: tuple[str, float] = ("", 0.0)
 
     # ------------------------------------------------------------------ #
     # GUI-thread API (all cheap, thread-safe attribute writes)
@@ -191,6 +215,31 @@ class CameraWorker(QThread):
         self._presence_on = enabled
         self._presence_failed = False
         self._wake.set()
+
+    def set_gestures(self, hand: bool, face: bool, look_away: bool, look_away_s: float) -> None:
+        self._gestures = (hand, face, look_away, float(look_away_s))
+        self._hand_failed = False
+        self._presence_failed = False
+        self._wake.set()
+
+    def set_body_outline(self, on: bool) -> None:
+        self._outline_on = on
+        self._wake.set()
+
+    def set_gesture_armed(self, armed: bool) -> None:
+        self._armed = armed
+
+    def snooze(self, seconds: float) -> None:
+        """Don't send watcher alerts for `seconds` (0 = stop snoozing)."""
+        self._snooze_until = time.monotonic() + max(0.0, seconds)
+
+    @property
+    def snoozed(self) -> bool:
+        return time.monotonic() < self._snooze_until
+
+    def _gestures_on(self) -> bool:
+        hand, face, away, _ = self._gestures
+        return hand or face or away
 
     def set_presence_zones(self, zones: list[list[float]]) -> None:
         self._presence_zones = [list(z) for z in zones]
@@ -256,6 +305,8 @@ class CameraWorker(QThread):
         finally:
             self._release()
             self.engine.unload()
+            self.segmenter.unload()
+            self.hand_models.unload()
             if self._state != CamState.ERROR:
                 self._set_state(CamState.STOPPED, "")
 
@@ -334,7 +385,7 @@ class CameraWorker(QThread):
             if self._settings_request or self._props_watch_until:
                 self._service_settings()
 
-            fps = self._fps if mode == "display" else MONITOR_FPS
+            fps = self._fps if mode == "display" else GESTURE_MONITOR_FPS if self._gestures_on() else MONITOR_FPS
             interval = 1.0 / max(1, fps)
             tolerance = 0.3 * interval
 
@@ -378,9 +429,10 @@ class CameraWorker(QThread):
             if self._motion_enabled and self.detector.process(frame, t1):
                 self.motion_detected.emit()
 
-            if self._presence_on or self._enroll_request or self._enroller is not None:
+            if (self._presence_on or self._gestures_on() or self._enroll_request
+                    or self._enroller is not None):
                 self._service_presence(frame, t1)
-            elif self.engine.loaded:
+            elif self.engine.loaded or self.segmenter.loaded or self.hand_models.loaded:
                 self._stop_presence()
 
             if mode == "display":
@@ -406,7 +458,8 @@ class CameraWorker(QThread):
     def _mode(self) -> str:
         if self._visible:
             return "display"
-        if (self._motion_enabled and self._monitor_hidden) or self._presence_on or self.enrolling:
+        if ((self._motion_enabled and self._monitor_hidden) or self._presence_on or self.enrolling
+                or self._gestures_on()):
             return "monitor"  # Watch my back keeps watching while the preview is hidden
         return "idle"
 
@@ -430,6 +483,9 @@ class CameraWorker(QThread):
         self.actual_size = (cam.width, cam.height)
         self.detector.reset()
         self.tracker.reset()
+        self.hand_tracker.reset()
+        self.head_tracker.reset()
+        self._head_box = None
         self._presence_key = None
         self._props_watch_until = 0.0
         if self._props:
@@ -492,30 +548,116 @@ class CameraWorker(QThread):
                 return
         if request == "start":
             self._enroller = Enroller(self.engine)
+        self._manage_models()
 
         if self._enroller is not None:
             self._publish_enroll_frame(frame)
-        if now < self._presence_due:
-            return
-        self._presence_due = now + 1.0 / PRESENCE_HZ
+        if now >= self._presence_due:
+            self._presence_due = now + 1.0 / PRESENCE_HZ
+            if self._enroller is not None:
+                self._enroll_step(frame, now)
+                return
+            self._presence_step(frame, now)
+        if self._enroller is None:
+            self._gesture_step(frame, now)
 
-        if self._enroller is not None:
-            self._enroll_step(frame, now)
-            return
+    def _manage_models(self) -> None:
+        """Load / unload the outline and hand models to match what is switched on."""
+        want_seg = self._presence_on and self._outline_on
+        if want_seg and not self.segmenter.loaded and not self._seg_failed:
+            try:
+                self.segmenter.load()
+            except FaceEngineError as exc:
+                self._seg_failed = True  # fall back to the background-difference check
+                log.error("Person outlines unavailable: %s", exc)
+        elif not want_seg and self.segmenter.loaded:
+            self.segmenter.unload()
+            self.tracker.me_mask = None
+        hand_on = self._gestures[0]
+        if hand_on and not self.hand_models.loaded and not self._hand_failed:
+            try:
+                self.hand_models.load()
+            except FaceEngineError as exc:
+                self._hand_failed = True
+                log.error("Hand gestures unavailable: %s", exc)
+                self.presence_changed.emit(PresenceState(error=str(exc)))
+        elif not hand_on and self.hand_models.loaded:
+            self.hand_models.unload()
+            self.hand_tracker.reset()
+            self._send_progress("", 0.0)
 
+    def _presence_step(self, frame: np.ndarray, now: float) -> None:
         dwell, person, threshold, cooldown, sensitivity = self._presence_cfg
         self.tracker.configure(dwell, person, threshold, cooldown, sensitivity)
         self.tracker.set_ignore_zones(self._presence_zones)
         state = self.tracker.update(frame, now)
-        self.detector.set_dynamic_zones([list(state.me_body)] if state.me_body else [])
-        if state.alert:
-            self.watcher_alert.emit(state.kind, state.watch_seconds)
-        if state.cleared:
-            self.watcher_cleared.emit()
+        if state.me_mask is not None:
+            self.detector.set_dynamic_mask(state.me_mask)  # the user's exact outline
+        else:
+            self.detector.set_dynamic_zones([list(state.me_body)] if state.me_body else [])
+        if self._presence_on:
+            if state.alert and now >= self._snooze_until:
+                self.watcher_alert.emit(state.kind, state.watch_seconds)
+            if state.cleared:
+                self.watcher_cleared.emit()
         key = state.key()
         if key != self._presence_key:
             self._presence_key = key
             self.presence_changed.emit(state)
+
+    def _gesture_step(self, frame: np.ndarray, now: float) -> None:
+        hand_on, face_on, away_on, away_s = self._gestures
+        tr = self.tracker
+        if hand_on and self.hand_models.loaded and now >= self._hand_due:
+            self._hand_due = now + 1.0 / HAND_HZ
+            res = self.hand_tracker.update(frame, now, tr.me_body, tr.me_mask)
+            if res.gesture:
+                log.info("Gesture: %s", res.gesture)
+                self.gesture.emit(res.gesture)
+            self._send_progress(res.pose or "", res.progress)
+        if (face_on or away_on) and now >= self._head_due:
+            self._head_due = now + 1.0 / HEAD_HZ
+            self.head_tracker.look_away_s = away_s
+            pose = self._head_pose(frame)
+            body = tr.me_mask is not None or tr.me_body is not None
+            g = self.head_tracker.update(now, pose, body, self._armed and face_on, away_on)
+            if g:
+                log.info("Gesture: %s", g)
+                self.gesture.emit(g)
+
+    def _head_pose(self, frame: np.ndarray) -> tuple[float, float] | None:
+        """Yaw/pitch of the user's face, from YuNet on a crop around it."""
+        box = self.tracker.me_face or self._head_box
+        if box is None:
+            return None
+        h, w = frame.shape[:2]
+        fx, fy, fw, fh = box
+        cx, cy = (fx + fw / 2) * w, (fy + fh / 2) * h
+        half = 1.25 * max(fw * w, fh * h)
+        x0, y0 = int(max(0, cx - half)), int(max(0, cy - half))
+        x1, y1 = int(min(w, cx + half)), int(min(h, cy + half))
+        crop = frame[y0:y1, x0:x1]
+        if crop.size == 0:
+            return None
+        best, best_iou = None, 0.15
+        for f in self.engine.detect(crop):
+            bx, by, bw, bh = f.box
+            full = ((x0 + bx * crop.shape[1]) / w, (y0 + by * crop.shape[0]) / h,
+                    bw * crop.shape[1] / w, bh * crop.shape[0] / h)
+            o = iou(full, box)
+            if o > best_iou:
+                best, best_iou = (f, full), o
+        if best is None:
+            return None
+        face, full = best
+        self._head_box = full
+        return head_pose(face.row)  # translation doesn't change the ratios
+
+    def _send_progress(self, pose: str, progress: float) -> None:
+        sent = (pose, round(progress, 1))
+        if sent != self._progress_sent:
+            self._progress_sent = sent
+            self.gesture_progress.emit(pose, progress)
 
     def _enroll_step(self, frame: np.ndarray, now: float) -> None:
         enroller = self._enroller
@@ -550,7 +692,13 @@ class CameraWorker(QThread):
 
     def _stop_presence(self) -> None:
         self.engine.unload()
+        self.segmenter.unload()
+        self.hand_models.unload()
         self.tracker.reset()
+        self.hand_tracker.reset()
+        self.head_tracker.reset()
+        self._head_box = None
+        self._send_progress("", 0.0)
         self.detector.set_dynamic_zones([])
         self._presence_key = None
         self.presence_changed.emit(PresenceState())

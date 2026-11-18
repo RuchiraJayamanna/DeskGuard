@@ -489,3 +489,75 @@ def test_face_enrolment_saves_profile(qapp, system, tmp_path):
     assert done["flip_h"] is True and done["progress"] == 1.0
     assert any(f is not None and f.shape == (180, 320, 3) for f in frames)
     assert not w.enrolling
+
+
+class FakeSegmenterOff:
+    loaded = False
+
+    def load(self):
+        raise __import__("deskguard.faces", fromlist=["FaceEngineError"]).FaceEngineError("no model in tests")
+
+    def unload(self):
+        pass
+
+    def segment(self, frame):
+        return None
+
+
+class FakeHandModelsW:
+    def __init__(self):
+        from tests.test_gestures import hand
+        self.loaded = False
+        self.loads = 0
+        # an open palm whose wrist sits in the user's body area (frame 640x480)
+        self.lm = hand() * 1.0 + [330, 150]
+
+    def load(self):
+        self.loaded, self.loads = True, self.loads + 1
+
+    def unload(self):
+        self.loaded = False
+
+    def detect_palms(self, image):
+        return np.array([np.r_[0, 0, 10, 10, np.zeros(14), 0.9]], np.float32)
+
+    def landmarks(self, image, palm):
+        return self.lm.copy()
+
+
+def test_hand_gesture_and_snooze(qapp, system, tmp_path):
+    from deskguard.faces import Face, FaceProfile
+
+    engine = FakeFaceEngine()
+    profile = FaceProfile(tmp_path / "face.json")
+    profile.vectors = [_vec(0)] * 3
+    hands = FakeHandModelsW()
+    w = CameraWorker(open_fn=system.open, engine=engine, profile=profile,
+                     segmenter=FakeSegmenterOff(), hand_models=hands)
+    gestures, progress, alerts = [], [], []
+    w.gesture.connect(gestures.append)
+    w.gesture_progress.connect(lambda name, p: progress.append((name, p)))
+    w.watcher_alert.connect(lambda k, s: alerts.append(k))
+    engine.faces = [Face((0.5, 0.2, 0.15, 0.25), 0.95, _vec(0))]  # the user
+    w.configure_camera(0, 640, 480, 10)
+    try:
+        w.start()
+        assert wait_until(qapp, lambda: w._state is not None and w._state.value == "live")
+        w.set_gestures(True, False, False, 2)
+        assert wait_until(qapp, lambda: "palm" in gestures, timeout=6)
+        assert hands.loads == 1 and any(name == "palm" and 0 < p < 1 for name, p in progress)
+        # snoozed alerts are not sent
+        w.snooze(60)
+        engine.faces = [Face((0.5, 0.2, 0.15, 0.25), 0.95, _vec(0)), Face((0.1, 0.2, 0.08, 0.12), 0.9, _vec(1))]
+        w.set_presence(True, 1.0, False, 0.363, 60, "medium")
+        t_end = time.monotonic() + 3
+        while time.monotonic() < t_end:
+            qapp.processEvents()
+            time.sleep(0.02)
+        assert alerts == [] and w.snoozed
+        w.snooze(0)
+        assert not w.snoozed
+        w.set_gestures(False, False, False, 2)
+        assert wait_until(qapp, lambda: not hands.loaded)
+    finally:
+        assert w.stop()

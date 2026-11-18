@@ -104,7 +104,7 @@ def test_app_starts_builds_menu_and_saves(qapp, tmp_path, monkeypatch):
 
     guard._build_menu()
     titles = [a.text() for a in guard.menu.actions()]
-    assert "Hide preview" in titles and any(t.startswith("Exit") for t in titles)
+    assert "Run in background (hide preview)" in titles and any(t.startswith("Exit") for t in titles)
 
     guard.tray.show()  # offscreen Qt has no real tray; pretend it is there
     # hide -> worker idle, show again -> frames resume

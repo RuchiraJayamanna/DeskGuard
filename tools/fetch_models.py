@@ -26,6 +26,18 @@ MODELS = {
         "face_recognition_sface/face_recognition_sface_2021dec_int8.onnx",
         "2b0e941e6f16cc048c20aee0c8e31f569118f65d702914540f7bfdc14048d78a",
     ),
+    "human_segmentation_pphumanseg_2023mar.onnx": (
+        "human_segmentation_pphumanseg/human_segmentation_pphumanseg_2023mar.onnx",
+        "552d8a984054e59b5d773d24b9b12022b22046ceb2bbc4c9aaeaceb36a9ddf24",
+    ),
+    "palm_detection_mediapipe_2023feb.onnx": (
+        "palm_detection_mediapipe/palm_detection_mediapipe_2023feb.onnx",
+        "78ff51c38496b7fc8b8ebdb6cc8c1abb02fa6c38427c6848254cdaba57fcce7c",
+    ),
+    "handpose_estimation_mediapipe_2023feb.onnx": (
+        "handpose_estimation_mediapipe/handpose_estimation_mediapipe_2023feb.onnx",
+        "db0898ae717b76b075d9bf563af315b29562e11f8df5027a1ef07b02bef6d81c",
+    ),
 }
 
 

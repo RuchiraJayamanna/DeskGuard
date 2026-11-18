@@ -34,13 +34,20 @@ DWELL_CHOICES: tuple[int, ...] = (3, 5, 10, 15)
 ALERT_COOLDOWN_CHOICES: tuple[int, ...] = (30, 60, 120, 300)
 STRICTNESS_CHOICES: tuple[str, ...] = ("relaxed", "normal", "strict")
 THEME_CHOICES: tuple[str, ...] = ("system", "dark", "light")
+HAND_GESTURES: tuple[str, ...] = ("palm", "thumbs_up", "peace", "fist")
+GESTURE_ACTIONS: tuple[str, ...] = ("toggle_preview", "dismiss", "snooze", "toggle_watch", "none")
+DEFAULT_GESTURE_ACTIONS: dict[str, str] = {
+    "palm": "toggle_preview", "thumbs_up": "dismiss", "peace": "snooze", "fist": "toggle_watch",
+}
+LOOK_AWAY_CHOICES: tuple[int, ...] = (1, 2, 3)
+PRIVACY_ACTIONS: tuple[str, ...] = ("show_desktop", "lock", "hide_preview")
 
 MIN_WINDOW_W, MIN_WINDOW_H = 160, 100
 MAX_WINDOW_W, MAX_WINDOW_H = 1920, 1200
 
 MAX_ZONES = 8
 MAX_CAMERAS_WITH_PROPS = 8
-CONFIG_VERSION = 3
+CONFIG_VERSION = 4
 
 # Hardware camera properties DeskGuard may save and re-apply (name -> cv2 CAP_PROP_* name).
 CAMERA_PROPS: dict[str, str] = {
@@ -116,8 +123,18 @@ class Config:
     watch_person_without_face: bool = True
     face_strictness: str = "normal"
     alert_cooldown_s: int = 60
+    body_outline: bool = True      # real body shapes (person segmentation, ~35 MB more RAM)
     # Appearance of the Settings window and toast.
     theme: str = "system"
+    # Gestures (only the user's own hand / face count). All off by default.
+    hand_gestures: bool = False
+    gesture_actions: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_GESTURE_ACTIONS))
+    face_gestures: bool = False
+    look_away_enabled: bool = False
+    look_away_s: int = 2
+    privacy_action: str = "show_desktop"
+    # Start with the preview hidden (camera on, everything keeps working).
+    start_in_background: bool = False
     config_version: int = CONFIG_VERSION
 
 
@@ -171,6 +188,13 @@ def _valid(name: str, value: Any, default: Any) -> bool:
         return value in STRICTNESS_CHOICES
     if name == "theme":
         return value in THEME_CHOICES
+    if name == "gesture_actions":
+        return (isinstance(value, dict) and set(value) <= set(HAND_GESTURES)
+                and all(v in GESTURE_ACTIONS for v in value.values()))
+    if name == "look_away_s":
+        return type(value) is int and value in LOOK_AWAY_CHOICES
+    if name == "privacy_action":
+        return value in PRIVACY_ACTIONS
     return False
 
 
@@ -204,6 +228,7 @@ def from_dict(data: dict[str, Any]) -> Config:
         cfg.width, cfg.height = Config.width, Config.height
     cfg.zoom, cfg.pan_x, cfg.pan_y = float(cfg.zoom), float(cfg.pan_x), float(cfg.pan_y)
     cfg.ignore_zones = [[float(v) for v in z] for z in cfg.ignore_zones]
+    cfg.gesture_actions = {**DEFAULT_GESTURE_ACTIONS, **cfg.gesture_actions}
     cfg.config_version = CONFIG_VERSION
     return cfg
 

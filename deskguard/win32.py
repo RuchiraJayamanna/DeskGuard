@@ -313,3 +313,50 @@ class CpuSampler:
         if d_wall <= 0:
             return 0.0
         return 100.0 * d_cpu / d_wall / self._ncpu
+
+
+# --------------------------------------------------------------------------- #
+# Privacy actions (used by the "look away" gesture)
+# --------------------------------------------------------------------------- #
+if IS_WINDOWS:
+
+    class _KEYBDINPUT(ctypes.Structure):
+        _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+    class _MOUSEINPUT(ctypes.Structure):
+        _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
+                    ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+    class _INPUTUNION(ctypes.Union):
+        _fields_ = [("ki", _KEYBDINPUT), ("mi", _MOUSEINPUT)]
+
+    class _INPUT(ctypes.Structure):
+        _fields_ = [("type", wintypes.DWORD), ("u", _INPUTUNION)]
+
+    _user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int]
+    _user32.SendInput.restype = wintypes.UINT
+    _user32.LockWorkStation.restype = wintypes.BOOL
+
+
+def show_desktop() -> bool:
+    """Press Win+D (minimise everything / show the desktop)."""
+    if not IS_WINDOWS:
+        return False
+    VK_LWIN, VK_D, KEYUP, INPUT_KEYBOARD = 0x5B, 0x44, 0x0002, 1
+    keys = [(VK_LWIN, 0), (VK_D, 0), (VK_D, KEYUP), (VK_LWIN, KEYUP)]
+    arr = (_INPUT * len(keys))()
+    for i, (vk, flags) in enumerate(keys):
+        arr[i].type = INPUT_KEYBOARD
+        arr[i].u.ki = _KEYBDINPUT(vk, 0, flags, 0, 0)
+    sent = _user32.SendInput(len(keys), arr, ctypes.sizeof(_INPUT))
+    if sent != len(keys):
+        log.warning("Show desktop: SendInput sent %d of %d events", sent, len(keys))
+    return sent == len(keys)
+
+
+def lock_workstation() -> bool:
+    """Lock Windows (same as Win+L)."""
+    if not IS_WINDOWS:
+        return False
+    return bool(_user32.LockWorkStation())

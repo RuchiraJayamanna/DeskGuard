@@ -58,3 +58,20 @@ def test_toast_buttons(qapp):
     assert t.texts()[0] == "Test alert"
     click(t, t._buttons()["dismiss"].center())
     assert not t.isVisible()
+
+
+def test_hud_pill_is_passive_and_hides(qapp, monkeypatch):
+    from deskguard.ui.toast import HudPill
+
+    h = HudPill()
+    flags = h.windowFlags()
+    assert flags & Qt.WindowType.WindowDoesNotAcceptFocus and flags & Qt.WindowType.WindowTransparentForInput
+    assert h.testAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+    h._hide_timer.setInterval(100)
+    h.show_message("hand", "Preview hidden – still watching", QRect(0, 0, 1280, 720))
+    assert h.isVisible() and h.width() > 200
+    h.grab()
+    deadline = time.monotonic() + 2
+    while h.isVisible() and time.monotonic() < deadline:
+        qapp.processEvents()
+    assert not h.isVisible()

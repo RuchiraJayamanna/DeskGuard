@@ -26,6 +26,7 @@ import numpy as np
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QBrush,
+    QPainterPath,
     QColor,
     QCursor,
     QFont,
@@ -115,6 +116,7 @@ class PreviewWindow(QWidget):
         self._presence_on = False
         self._alert_until = 0.0
         self._alert_timer = QTimer(self, singleShot=True, timeout=self.update)
+        self._gesture: tuple[str, float] = ("", 0.0)   # pose being held, progress 0..1
 
         self._motion_timer = QTimer(self)
         self._motion_timer.setSingleShot(True)
@@ -136,6 +138,11 @@ class PreviewWindow(QWidget):
     def set_presence(self, state: PresenceState | None, enabled: bool) -> None:
         self._presence, self._presence_on = state, enabled
         self.update()
+
+    def set_gesture_progress(self, pose: str, progress: float) -> None:
+        if (pose, progress) != self._gesture:
+            self._gesture = (pose, progress)
+            self.update()
 
     def flash_alert(self, seconds: float) -> None:
         """Highlight the watcher(s) in red for a while."""
@@ -231,6 +238,7 @@ class PreviewWindow(QWidget):
 
         self._paint_zones(p)
         self._paint_presence(p)
+        self._paint_gesture(p)
 
         motion = time.monotonic() < self._motion_until
         if motion:
@@ -313,11 +321,20 @@ class PreviewWindow(QWidget):
         ow, oh = vt.output_size()
         p.save()
         p.setClipRect(QRectF(ox, oy, ow, oh))
-        if st.me_body is not None:
+        if st.me_outline:
+            path = QPainterPath()
+            for part in st.me_outline:
+                path.addPath(self._outline_path(vt, part))
+            p.setPen(QPen(QColor(34, 197, 94, 190), 1.4, Qt.PenStyle.DashLine))
+            p.setBrush(QColor(34, 197, 94, 38))
+            p.drawPath(path)
+            rect = self._outline_path(vt, st.me_outline[0]).boundingRect()  # tag on the largest part
+        elif st.me_body is not None:
             rect = self._box_rect(vt, st.me_body)
             p.setPen(QPen(QColor(34, 197, 94, 150), 1.2, Qt.PenStyle.DashLine))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 6, 6)
+        if st.me_outline or st.me_body is not None:
             p.setFont(self._font)
             tag = QRectF(rect.left() + 4, rect.top() + 3, 28, 14)
             p.setPen(Qt.PenStyle.NoPen)
@@ -325,7 +342,14 @@ class PreviewWindow(QWidget):
             p.drawRoundedRect(tag, 3, 3)
             p.setPen(QColor("white"))
             p.drawText(tag, int(Qt.AlignmentFlag.AlignCenter), "You")
-        boxes = list(st.strangers) + ([st.person] if st.person is not None and not st.strangers else [])
+        fill = QColor(MOTION_RED)
+        fill.setAlpha(70 if alert else 40)
+        for pts in st.people_outlines:
+            p.setPen(QPen(MOTION_RED, 2.2 if alert else 1.5))
+            p.setBrush(fill)
+            p.drawPath(self._outline_path(vt, pts))
+        person_box = [st.person] if st.person is not None and not st.strangers and not st.people_outlines else []
+        boxes = list(st.strangers) + person_box
         for box in boxes:
             rect = self._box_rect(vt, box).adjusted(-2, -2, 2, 2)
             fill = QColor(MOTION_RED)
@@ -344,6 +368,40 @@ class PreviewWindow(QWidget):
             p.drawRoundedRect(badge, 8.5, 8.5)
             p.setPen(QColor("white"))
             p.drawText(badge, int(Qt.AlignmentFlag.AlignCenter), text)
+
+    @staticmethod
+    def _outline_path(vt: ViewTransform, pts: list[tuple[float, float]]) -> QPainterPath:
+        path = QPainterPath()
+        for i, (u, v) in enumerate(pts):
+            x, y = vt.raw_to_widget(u, v)
+            if i == 0:
+                path.moveTo(x, y)
+            else:
+                path.lineTo(x, y)
+        path.closeSubpath()
+        return path
+
+    def _paint_gesture(self, p: QPainter) -> None:
+        """Small ring that fills while the user holds a hand gesture."""
+        pose, progress = self._gesture
+        if not pose or self._zone_edit:
+            return
+        label = {"palm": "Open palm", "thumbs_up": "Thumbs up", "peace": "Peace", "fist": "Fist"}.get(pose, pose)
+        p.setFont(self._bold)
+        w = p.fontMetrics().horizontalAdvance(label) + 40
+        r = QRectF(6, self.height() - 30, w, 24)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 170))
+        p.drawRoundedRect(r, 12, 12)
+        ring = QRectF(r.left() + 5, r.top() + 4, 16, 16)
+        p.setPen(QPen(QColor(255, 255, 255, 70), 2.5))
+        p.drawEllipse(ring)
+        pen = QPen(QColor("#60cdff"), 2.5)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.drawArc(ring, 90 * 16, -int(360 * 16 * max(0.0, min(1.0, progress))))
+        p.setPen(QColor("white"))
+        p.drawText(r.adjusted(28, 0, -8, 0), int(Qt.AlignmentFlag.AlignVCenter), label)
 
     def _zone_rect(self, vt: ViewTransform, zone: list[float]) -> QRectF:
         x, y, w, h = zone

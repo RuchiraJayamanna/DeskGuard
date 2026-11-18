@@ -62,6 +62,7 @@ class MotionDetector:
         self._zones: tuple[np.ndarray | None, int] = (None, w * h)
         self._static_zones: list[list[float]] = []
         self._dynamic_zones: list[list[float]] = []
+        self._dynamic_mask: np.ndarray | None = None  # the user's body outline (255 = ignore)
         self._zones_lock = threading.Lock()  # GUI sets static zones, worker sets dynamic ones
         self._background: np.ndarray | None = None
         self._consecutive = 0
@@ -83,17 +84,33 @@ class MotionDetector:
     def set_dynamic_zones(self, zones: list[list[float]]) -> None:
         """Extra ignore rectangles that change at runtime (the user's body area)."""
         zones = [list(z) for z in zones]
-        if zones != self._dynamic_zones:
+        if zones != self._dynamic_zones or self._dynamic_mask is not None:
             self._dynamic_zones = zones
+            self._dynamic_mask = None
             self._rebuild_mask()
+
+    def set_dynamic_mask(self, mask: np.ndarray | None) -> None:
+        """Ignore motion inside the non-zero pixels of `mask` (any size; e.g. the
+        user's body outline). Replaces any dynamic rectangles."""
+        if mask is None and self._dynamic_mask is None:
+            return
+        if mask is not None:
+            w, h = self.size
+            if mask.shape[:2] != (h, w):
+                mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
+            if self._dynamic_mask is not None and np.array_equal(mask, self._dynamic_mask):
+                return
+        self._dynamic_mask = mask
+        self._dynamic_zones = []
+        self._rebuild_mask()
 
     def _rebuild_mask(self) -> None:
         with self._zones_lock:
-            self._build_mask(self._static_zones + self._dynamic_zones)
+            self._build_mask(self._static_zones + self._dynamic_zones, self._dynamic_mask)
 
-    def _build_mask(self, zones: list[list[float]]) -> None:
+    def _build_mask(self, zones: list[list[float]], shape: np.ndarray | None = None) -> None:
         w, h = self.size
-        if not zones:
+        if not zones and shape is None:
             self._zones = (None, w * h)
             return
         mask = np.full((h, w), 255, np.uint8)
@@ -101,6 +118,8 @@ class MotionDetector:
             x0, y0 = int(np.floor(zx * w)), int(np.floor(zy * h))
             x1, y1 = int(np.ceil((zx + zw) * w)), int(np.ceil((zy + zh) * h))
             mask[max(0, y0):max(0, y1), max(0, x0):max(0, x1)] = 0
+        if shape is not None:
+            mask[shape > 0] = 0
         self._zones = (mask, cv2.countNonZero(mask))
 
     def reset(self) -> None:

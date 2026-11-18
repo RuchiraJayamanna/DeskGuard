@@ -10,8 +10,11 @@ Two independent ways to notice a watcher
    the face isn't visible. The user's body area and manual ignore zones are
    masked out.
 
-The user's body area is derived from where their face is, and it stays at the
-last known place when the face disappears (looking down, turning away).
+With the person-segmentation model loaded, both the user and other people are
+real body outlines: the user's outline is the person region that touches their
+recognised face (and stays when the face disappears – looking down, turning
+away); every other person region is "someone else". Without it, a rectangle
+derived from the face and a background-difference check are used instead.
 
 An alert fires once per episode when someone has been present for `dwell`
 seconds (short gaps tolerated), and not more often than `cooldown`.
@@ -25,6 +28,7 @@ import cv2
 import numpy as np
 
 from deskguard.faces import Box, Face, FaceEngine, FaceProfile
+from deskguard.segmentation import Outline, PersonSegmenter, mask_box, outline, outlines
 
 PERSON_MIN_AREA: dict[str, float] = {"low": 0.05, "medium": 0.03, "high": 0.015}
 PERSON_MIN_HEIGHT = 0.20      # of frame height
@@ -38,6 +42,8 @@ CLEAR_S = 3.0                 # nobody for this long => episode over
 RECHECK_S = 3.0               # re-verify confirmed face tracks this often
 TRACK_MISSES = 4              # drop a face track after this many updates unseen
 MAX_EMBEDS_PER_UPDATE = 3
+MIN_COMPONENT = 0.004         # ignore person-mask specks smaller than this share of the frame
+ABOVE_HEAD = 0.6              # mask rows this many face-heights above the user's face are not the user
 
 
 def body_from_face(face: Box) -> Box:
@@ -79,19 +85,27 @@ class PresenceState:
     alert: bool = False               # True on the update that crosses the dwell time
     cleared: bool = False             # True on the update that ends an alerted episode
     error: str = ""
+    me_mask: np.ndarray | None = None             # 0/255 at 160x120, raw orientation
+    me_outline: list[Outline] = field(default_factory=list)  # one polygon per separate part
+    people_outlines: list[Outline] = field(default_factory=list)
 
     def key(self) -> tuple:
         """Coarse fingerprint used to avoid re-sending unchanged states to the GUI."""
         def r(b: Box | None) -> tuple | None:
             return None if b is None else tuple(round(v, 2) for v in b)
+        def o(pts: Outline) -> tuple:
+            return tuple(round(v, 2) for pt in pts[:: max(1, len(pts) // 8)] for v in pt)
         return (r(self.me_face), r(self.me_body), tuple(r(b) for b in self.strangers), r(self.person),
-                self.watching, self.kind, int(self.watch_seconds), self.alert, self.cleared, self.error)
+                self.watching, self.kind, int(self.watch_seconds), self.alert, self.cleared, self.error,
+                tuple(o(x) for x in self.me_outline), tuple(o(x) for x in self.people_outlines))
 
 
 class PresenceTracker:
-    def __init__(self, engine: FaceEngine, profile: FaceProfile, size: tuple[int, int] = (160, 120)) -> None:
+    def __init__(self, engine: FaceEngine, profile: FaceProfile, size: tuple[int, int] = (160, 120),
+                 segmenter: PersonSegmenter | None = None) -> None:
         self.engine = engine
         self.profile = profile
+        self.segmenter = segmenter
         self.size = size
         self.dwell = 5.0
         self.person_trigger = True
@@ -123,6 +137,10 @@ class PresenceTracker:
         self._next_id = 1
         self.me_face: Box | None = None
         self.me_body: Box | None = None
+        self.me_row: np.ndarray | None = None      # YuNet points of the user's face (when visible)
+        self.me_mask: np.ndarray | None = None
+        self._me_outline: list[Outline] = []
+        self._head_y: float | None = None          # rows above this are not the user
         self._bg: np.ndarray | None = None
         self._updates = 0
         self._cand_start: float | None = None
@@ -142,13 +160,20 @@ class PresenceTracker:
         if faces is None:
             faces = self.engine.detect(frame)
         self._update_tracks(frame, now, faces)
-        person = self._person_blob(frame)
+        seg = self.segmenter.segment(frame) if self.segmenter is not None and self.segmenter.loaded else None
+        people: list[Outline] = []
+        if seg is not None:
+            person, people = self._split_people(seg)
+        else:
+            person = self._person_blob(frame)
         self._updates += 1
 
         strangers = [t.face.box for t in self._tracks if t.label == "stranger" and t.missed == 0]
         kind = "face" if strangers else "person" if person is not None else ""
 
-        state = PresenceState(me_face=self.me_face, me_body=self.me_body, strangers=strangers, person=person)
+        state = PresenceState(me_face=self.me_face, me_body=self.me_body, strangers=strangers, person=person,
+                              me_mask=self.me_mask, me_outline=self._me_outline if seg is not None else [],
+                              people_outlines=people)
         if kind:
             if self._cand_start is None:
                 self._cand_start = now
@@ -217,9 +242,87 @@ class PresenceTracker:
         if me:
             mine = max(me, key=lambda t: t.face.box[2] * t.face.box[3])
             self.me_face = mine.face.box
-            self.me_body = body_from_face(mine.face.box)  # sticky until seen again
-        elif not any(t.label == "me" for t in self._tracks):
-            self.me_face = None  # keep me_body: the user is probably just looking away
+            self.me_row = mine.face.row
+            fx, fy, fw, fh = mine.face.box
+            self._head_y = fy - ABOVE_HEAD * fh
+            if self.me_mask is None:
+                self.me_body = body_from_face(mine.face.box)  # sticky until seen again
+        else:
+            self.me_row = None
+            if not any(t.label == "me" for t in self._tracks):
+                self.me_face = None  # keep the body area: the user is probably just looking away
+
+    # ------------------------------------------------------------------ #
+    def _split_people(self, mask: np.ndarray) -> tuple[Box | None, list[Outline]]:
+        """Separate the user's outline from other people in a person mask."""
+        w, h = self.size
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        mine = 0
+        if self.me_face is not None and self.me_row is not None:
+            fx, fy, fw, fh = self.me_face
+            x0, y0 = max(0, int(fx * w)), max(0, int(fy * h))
+            x1, y1 = min(w, int(np.ceil((fx + fw) * w)) + 1), min(h, int(np.ceil((fy + fh) * h)) + 1)
+            region = labels[y0:y1, x0:x1]
+            counts = np.bincount(region.ravel(), minlength=n)
+            counts[0] = 0
+            if counts.size > 1 and counts.max() >= 0.1 * max(1, region.size):
+                mine = int(counts.argmax())
+        elif self.me_mask is not None:
+            prev = self.me_mask > 0
+            counts = np.bincount(labels[prev], minlength=n)
+            counts[0] = 0
+            if counts.size > 1 and counts.max() >= 0.15 * max(1, int(prev.sum())):
+                mine = int(counts.argmax())
+
+        if mine:
+            parts = {mine}
+            if self.me_face is not None and self.me_row is not None:
+                # The torso can come out as a separate region (neck, hair, scarf):
+                # anything starting just below the face and lined up with it is the user too.
+                fx, fy, fw, fh = self.me_face
+                left, right = (fx - 1.2 * fw) * w, (fx + 2.2 * fw) * w
+                face_bottom = (fy + fh) * h
+                for i in range(1, n):
+                    x, y, bw, bh, _ = (int(v) for v in stats[i])
+                    if (i != mine and fy * h + 0.5 * fh * h <= y <= face_bottom + 1.5 * fh * h
+                            and x < right and x + bw > left):
+                        parts.add(i)
+            elif self.me_mask is not None:
+                prev = self.me_mask > 0
+                for i in range(1, n):
+                    comp = labels == i
+                    area = int(stats[i][cv2.CC_STAT_AREA])
+                    if i != mine and area and int((comp & prev).sum()) >= 0.5 * area:
+                        parts.add(i)
+            me = np.isin(labels, list(parts)).astype(np.uint8) * 255
+            if self._head_y is not None and self._head_y > 0:
+                me[: int(self._head_y * h)] = 0  # someone standing right behind, above the user's head
+            me = cv2.dilate(me, self._kernel, iterations=2)
+            self.me_mask = me
+            self._me_outline = outlines(me)
+            self.me_body = mask_box(me) or self.me_body
+
+        # Others: everything that isn't the user and isn't inside an ignore zone.
+        if self.me_mask is None or not self.person_trigger or self._updates < 1:
+            return None, []  # the user's own body would otherwise look like "someone"
+        others = cv2.bitwise_and(mask, cv2.bitwise_not(self.me_mask))
+        for zx, zy, zw, zh in self._zones:
+            others[max(0, int(zy * h)):max(0, int(np.ceil((zy + zh) * h))),
+                   max(0, int(zx * w)):max(0, int(np.ceil((zx + zw) * w)))] = 0
+        cv2.morphologyEx(others, cv2.MORPH_OPEN, self._kernel, dst=others)
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(others, connectivity=8)
+        min_area = max(MIN_COMPONENT, PERSON_MIN_AREA.get(self.sensitivity, 0.03)) * w * h
+        best: Box | None = None
+        best_area = 0
+        found: list[Outline] = []
+        for i in range(1, n):
+            x, y, bw, bh, area = (int(v) for v in stats[i])
+            if area < min_area or bh < PERSON_MIN_HEIGHT * h * 0.6:
+                continue
+            found.append(outline((labels == i).astype(np.uint8) * 255))
+            if area > best_area:
+                best, best_area = (x / w, y / h, bw / w, bh / h), area
+        return best, found
 
     # ------------------------------------------------------------------ #
     def _person_blob(self, frame: np.ndarray) -> Box | None:

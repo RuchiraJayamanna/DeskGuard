@@ -56,7 +56,8 @@ def icon(status: str | None = None) -> QIcon:
 # --------------------------------------------------------------------------- #
 # Line glyphs (Fluent-style, 1.5 px strokes) for the Settings window and toast
 # --------------------------------------------------------------------------- #
-GLYPHS = ("shield", "motion", "camera", "view", "window", "lock", "face", "eye", "check", "close", "alert")
+GLYPHS = ("shield", "motion", "camera", "view", "window", "lock", "face", "eye", "check", "close", "alert",
+          "hand", "snooze")
 
 
 def _shield_path(r: QRectF):  # type: ignore[no-untyped-def]
@@ -121,6 +122,17 @@ def draw_glyph(p: QPainter, name: str, rect: QRectF, color: QColor, width: float
         p.drawPoint(QPointF(c.x() + w * 0.14, y + h * 0.34))
         p.drawArc(QRectF(c.x() - w * 0.16, y + h * 0.38, w * 0.32, h * 0.22), -20 * 16, -140 * 16)
         p.drawLine(QPointF(x + w * 0.05, y + h), QPointF(x + w * 0.95, y + h))
+    elif name == "hand":
+        # open hand: palm + four fingers + thumb
+        p.drawRoundedRect(QRectF(x + w * 0.2, y + h * 0.45, w * 0.55, h * 0.5), 4, 4)
+        for i, top in enumerate((0.12, 0.02, 0.06, 0.18)):
+            fx = x + w * (0.26 + i * 0.14)
+            p.drawLine(QPointF(fx, y + h * 0.47), QPointF(fx, y + h * top))
+        p.drawLine(QPointF(x + w * 0.22, y + h * 0.65), QPointF(x + w * 0.02, y + h * 0.45))
+    elif name == "snooze":
+        p.drawEllipse(QRectF(x + w * 0.08, y + h * 0.12, w * 0.84, h * 0.84))
+        p.drawPolyline([QPointF(c.x(), y + h * 0.3), QPointF(c.x(), c.y() + h * 0.04),
+                        QPointF(c.x() + w * 0.18, c.y() + h * 0.16)])
     elif name == "check":
         p.drawPolyline([QPointF(x + w * 0.15, c.y()), QPointF(x + w * 0.42, y + h * 0.78),
                         QPointF(x + w * 0.88, y + h * 0.22)])
